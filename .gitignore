@@ -1,0 +1,10 @@
+.gradle/
+.kotlin/
+build/
+**/build/
+local.properties
+signing.env
+signingkey.jks
+*.jks
+*.keystore
+.DS_Store
