@@ -519,6 +519,7 @@ abstract class NTKBase(
                 return
             }
             if (isComplete.compareAndSet(false, true)) {
+                android.webkit.CookieManager.getInstance().flush()
                 finalHtml.set(html)
                 latch.countDown()
             }
@@ -583,6 +584,7 @@ abstract class NTKBase(
         }
 
         latch.await(28, TimeUnit.SECONDS)
+        android.webkit.CookieManager.getInstance().flush()
         return finalHtml.get()
     }
 
@@ -835,20 +837,23 @@ abstract class NTKBase(
                 ),
             ).toRequestBody(JSON_MEDIA_TYPE)
 
+            val requestHeaders = headers.newBuilder()
+                .set("Accept", "application/json")
+                .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+                .set("Cache-Control", "no-store")
+                .set("Content-Type", "application/json")
+                .set("Origin", rootUrl)
+                .set("Referer", referer)
+                .set("User-Agent", userAgent)
+                .set("x-images-client", "viewer-v1")
+                .apply {
+                    webViewCookieHeader(referer, "nv=$nvCookie")?.let { set("Cookie", it) }
+                }
+                .build()
+
             return Request.Builder()
                 .url("$rootUrl/api/$contentKind-images")
-                .headers(
-                    headers.newBuilder()
-                        .set("Accept", "application/json")
-                        .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
-                        .set("Cache-Control", "no-store")
-                        .set("Content-Type", "application/json")
-                        .set("Origin", rootUrl)
-                        .set("Referer", referer)
-                        .set("User-Agent", userAgent)
-                        .set("x-images-client", "viewer-v1")
-                        .build(),
-                )
+                .headers(requestHeaders)
                 .post(body)
                 .build()
         }
@@ -889,20 +894,25 @@ abstract class NTKBase(
     private fun issueNvCookie(referer: String): String {
         val userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
 
-        fun buildRequest() = Request.Builder()
-            .url("$rootUrl/api/nv-issue")
-            .headers(
-                headers.newBuilder()
-                    .set("Accept", "application/json")
-                    .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
-                    .set("Cache-Control", "no-store")
-                    .set("Origin", rootUrl)
-                    .set("Referer", referer)
-                    .set("User-Agent", userAgent)
-                    .build(),
-            )
-            .post("".toRequestBody(null))
-            .build()
+        fun buildRequest(): Request {
+            val requestHeaders = headers.newBuilder()
+                .set("Accept", "application/json")
+                .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+                .set("Cache-Control", "no-store")
+                .set("Origin", rootUrl)
+                .set("Referer", referer)
+                .set("User-Agent", userAgent)
+                .apply {
+                    webViewCookieHeader(referer)?.let { set("Cookie", it) }
+                }
+                .build()
+
+            return Request.Builder()
+                .url("$rootUrl/api/nv-issue")
+                .headers(requestHeaders)
+                .post("".toRequestBody(null))
+                .build()
+        }
 
         client.newCall(buildRequest()).execute().use { firstResponse ->
             val nv = extractCookieValue(firstResponse.headers("Set-Cookie"), "nv")
@@ -976,6 +986,28 @@ abstract class NTKBase(
             "cf-mitigated" in lower ||
             "just a moment" in lower ||
             "보안 확인 수행 중" in html
+    }
+
+    private fun webViewCookieHeader(url: String, vararg extraCookies: String): String? {
+        val cookieManager = android.webkit.CookieManager.getInstance()
+        val cookiePairs = listOfNotNull(
+            cookieManager.getCookie(rootUrl),
+            cookieManager.getCookie(url),
+        ) + extraCookies
+        val cookieMap = linkedMapOf<String, String>()
+        cookiePairs.flatMap { it.split(';') }
+            .map { it.trim() }
+            .filter { it.contains('=') }
+            .forEach { cookie ->
+                val name = cookie.substringBefore('=').trim()
+                val value = cookie.substringAfter('=').trim()
+                if (name.isNotEmpty() && value.isNotEmpty()) {
+                    cookieMap[name] = value
+                }
+            }
+
+        return cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            .takeIf { it.isNotBlank() }
     }
 
     private fun isCloudflareApiResponse(code: Int, body: String): Boolean {
