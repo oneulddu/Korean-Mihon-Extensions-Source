@@ -346,10 +346,20 @@ abstract class NTKBase(
 
     override fun pageListParse(response: Response): List<Page> {
         val data = response.parseAs<PageImagesResponse>()
+        val referer = response.request.url.toString()
         return data.images.mapIndexed { i, image ->
-            Page(i, imageUrl = image.src)
+            val imageUrl = response.request.url.resolve(image.src)?.toString() ?: image.src
+            Page(i, referer, imageUrl)
         }
     }
+
+    override fun imageRequest(page: Page) = GET(
+        page.imageUrl!!,
+        headers.newBuilder()
+            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .set("Referer", page.url.ifBlank { rootUrl })
+            .build(),
+    )
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
