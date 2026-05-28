@@ -80,7 +80,6 @@ abstract class NTKBase(
         }
 
         var finalHtml: String? = null
-        var blockedMessage: String? = null
         val latch = CountDownLatch(1)
         val handler = Handler(Looper.getMainLooper())
 
@@ -110,12 +109,6 @@ abstract class NTKBase(
                         finalHtml = html
                         latch.countDown()
                     }
-
-                    @JavascriptInterface
-                    fun blocked(message: String) {
-                        blockedMessage = message
-                        latch.countDown()
-                    }
                 },
                 "TrojanTunnel",
             )
@@ -141,27 +134,12 @@ abstract class NTKBase(
 
                     super.onPageStarted(view, url, favicon)
                 }
-
-                override fun onPageFinished(view: WebView, url: String) {
-                    val lockCheckScript = """
-                        (function() {
-                            const text = document.body ? document.body.innerText : '';
-                            if (text.includes('로그인 후 이용 가능한 컨텐츠') || text.includes('회차 잠금')) {
-                                window.TrojanTunnel.blocked('로그인/포인트가 필요한 잠금 회차입니다.');
-                            }
-                        })();
-                    """.trimIndent()
-                    view.evaluateJavascript(lockCheckScript, null)
-                    super.onPageFinished(view, url)
-                }
             }
 
             webView.loadUrl(request.url.toString())
         }
 
         latch.await(20, TimeUnit.SECONDS)
-
-        blockedMessage?.let { throw Exception(it) }
 
         finalHtml?.let {
             val isJson = it.trim().startsWith("{")
