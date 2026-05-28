@@ -1,0 +1,83 @@
+name: Build and publish Xtoon
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/ko/xtoon/**'
+      - 'core/**'
+      - 'common/**'
+      - 'gradle/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'scripts/update_xtoon_repo.py'
+      - '.github/workflows/build_xtoon_release.yml'
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Restore signing key
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$SIGNING_KEYSTORE_BASE64" ]; then
+            echo "SIGNING_KEYSTORE_BASE64 secret is required" >&2
+            exit 1
+          fi
+          echo "$SIGNING_KEYSTORE_BASE64" | base64 --decode > signingkey.jks
+
+      - name: Build Xtoon release APK
+        env:
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :src:ko:xtoon:assembleRelease
+
+      - name: Checkout deployment repository
+        uses: actions/checkout@v4
+        with:
+          repository: oneulddu/Xtoon-Mihon-Extension
+          ref: repo
+          path: deploy
+          token: ${{ secrets.DEPLOY_TOKEN }}
+
+      - name: Update deployment repository files
+        run: |
+          APK_PATH=$(find src/ko/xtoon/build/outputs/apk/release -name 'tachiyomi-ko.xtoon-v*-release.apk' | sort | tail -n 1)
+          python3 scripts/update_xtoon_repo.py \
+            --source-dir "$GITHUB_WORKSPACE" \
+            --deploy-dir "$GITHUB_WORKSPACE/deploy" \
+            --apk "$APK_PATH"
+
+      - name: Commit and push deployment repository
+        run: |
+          cd deploy
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md index.html index.json index.min.json repo.json apk icon
+          if git diff --cached --quiet; then
+            echo "No deployment changes"
+            exit 0
+          fi
+          git commit -m "chore: Xtoon 배포 갱신"
+          git push origin repo

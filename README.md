@@ -27,6 +27,23 @@ xtoon
 
 `newtoki` 이름으로 남아 있는 최종 디렉터리는 없고, 해당 PR 최종 상태에서는 `ntk` 패키지로 정리되어 있습니다.
 
+
+## 자동 빌드/배포
+
+`.github/workflows/build_xtoon_release.yml`가 Xtoon 확장을 빌드하고 `oneulddu/Xtoon-Mihon-Extension`의 `repo` 브랜치에 APK와 인덱스를 갱신합니다.
+
+필요한 GitHub Secrets:
+
+```text
+SIGNING_KEYSTORE_BASE64  # signingkey.jks를 base64 인코딩한 값
+KEY_STORE_PASSWORD
+ALIAS
+KEY_PASSWORD
+DEPLOY_TOKEN             # 배포 레포 contents write 권한이 있는 토큰
+```
+
+서명키와 토큰은 민감 정보라 레포에는 넣지 않습니다.
+
 ## 빌드
 
 Java와 Android SDK가 필요합니다.
