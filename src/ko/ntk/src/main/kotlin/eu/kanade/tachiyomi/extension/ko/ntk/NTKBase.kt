@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.ko.ntk
 
 import android.annotation.SuppressLint
+import android.util.Base64
 import android.app.Application
 import android.os.Handler
 import android.os.Looper
@@ -30,10 +31,13 @@ import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
@@ -41,6 +45,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 abstract class NTKBase(
     override val name: String,
@@ -73,10 +79,7 @@ abstract class NTKBase(
     override fun mangaDetailsRequest(manga: SManga) = GET(rootUrl + manga.url, headers)
     override fun chapterListRequest(manga: SManga) = GET(rootUrl + manga.url, headers)
 
-    override fun pageListRequest(chapter: SChapter) = GET(
-        url = rootUrl + chapter.url,
-        headers = headers.newBuilder().add("X-WebView-Intercept", "true").build(),
-    )
+    override fun pageListRequest(chapter: SChapter) = GET(rootUrl + chapter.url, headers)
 
     private val imageBridgeScript = """
         (function() {
@@ -528,7 +531,17 @@ abstract class NTKBase(
 
     @Serializable
     private data class PageImage(
+        val page: Int? = null,
         val src: String,
+    )
+
+    @Serializable
+    private data class ImageApiRequest(
+        val workId: String,
+        val episodeId: String,
+        val token: String,
+        val nonce: String,
+        val proof: String,
     )
 
     protected fun htmlCardParse(response: Response): MangasPage {
@@ -658,12 +671,158 @@ abstract class NTKBase(
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val data = response.parseAs<PageImagesResponse>()
-        val referer = response.request.url.toString()
-        return data.images.mapIndexed { i, image ->
-            val imageUrl = response.request.url.resolve(image.src)?.toString() ?: image.src
-            Page(i, referer, imageUrl)
+        val chapterUrl = response.request.url
+        val referer = chapterUrl.toString()
+        val segments = chapterUrl.pathSegments
+        val workId = segments.getOrNull(1)
+            ?: throw Exception("NTK image API failed: missing work id from $referer")
+        val episodeId = segments.getOrNull(2)
+            ?: throw Exception("NTK image API failed: missing episode id from $referer")
+
+        val html = response.body.string()
+        if (html.contains("challenge-platform") || html.contains("cf-mitigated") || html.contains("보안 확인 수행 중")) {
+            throw Exception("NTK image API failed: Cloudflare challenge page was returned for $referer")
         }
+
+        val imagesToken = extractHtmlString(html, "imagesToken")
+            ?: throw Exception("NTK image API failed: imagesToken not found for $referer")
+
+        val nvCookie = extractCookieValue(response.headers("Set-Cookie"), "nv")
+            ?.takeIf(::isValidNvCookie)
+            ?: issueNvCookie(referer)
+
+        val data = fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
+        return data.images.sortedWith(compareBy<PageImage> { it.page ?: Int.MAX_VALUE }.thenBy { it.src })
+            .mapIndexed { i, image ->
+                val imageUrl = chapterUrl.resolve(image.src)?.toString() ?: image.src
+                Page(i, referer, imageUrl)
+            }
+    }
+
+    private fun fetchPageImages(
+        workId: String,
+        episodeId: String,
+        imagesToken: String,
+        nvCookie: String,
+        referer: String,
+    ): PageImagesResponse {
+        val userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
+        val nonce = randomBase64Url(24)
+        val proof = hmacSha256Base64Url(nvCookie, "$imagesToken.$nonce.$userAgent")
+        val body = json.encodeToString(
+            ImageApiRequest(
+                workId = workId,
+                episodeId = episodeId,
+                token = imagesToken,
+                nonce = nonce,
+                proof = proof,
+            ),
+        ).toRequestBody(JSON_MEDIA_TYPE)
+
+        val request = Request.Builder()
+            .url("$rootUrl/api/$contentKind-images")
+            .headers(
+                headers.newBuilder()
+                    .set("Accept", "application/json")
+                    .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+                    .set("Cache-Control", "no-store")
+                    .set("Content-Type", "application/json")
+                    .set("Origin", rootUrl)
+                    .set("Referer", referer)
+                    .set("User-Agent", userAgent)
+                    .set("x-images-client", "viewer-v1")
+                    .build(),
+            )
+            .post(body)
+            .build()
+
+        client.newCall(request).execute().use { apiResponse ->
+            val responseBody = apiResponse.body.string()
+            if (!apiResponse.isSuccessful) {
+                throw Exception("NTK image API failed: HTTP ${apiResponse.code} for $referer: ${responseBody.take(500)}")
+            }
+            return runCatching {
+                json.decodeFromString<PageImagesResponse>(responseBody)
+            }.getOrElse { error ->
+                throw Exception("NTK image API failed: invalid image JSON for $referer: ${responseBody.take(500)}", error)
+            }
+        }
+    }
+
+    private fun issueNvCookie(referer: String): String {
+        val userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
+        val request = Request.Builder()
+            .url("$rootUrl/api/nv-issue")
+            .headers(
+                headers.newBuilder()
+                    .set("Accept", "application/json")
+                    .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+                    .set("Cache-Control", "no-store")
+                    .set("Origin", rootUrl)
+                    .set("Referer", referer)
+                    .set("User-Agent", userAgent)
+                    .build(),
+            )
+            .post("".toRequestBody(null))
+            .build()
+
+        client.newCall(request).execute().use { nvResponse ->
+            val nv = extractCookieValue(nvResponse.headers("Set-Cookie"), "nv")
+            if (nvResponse.isSuccessful && nv != null && isValidNvCookie(nv)) {
+                return nv
+            }
+            val errorBody = nvResponse.body.string().take(500)
+            throw Exception("NTK image API failed: nv cookie issue failed with HTTP ${nvResponse.code}: $errorBody")
+        }
+    }
+
+    private fun extractHtmlString(html: String, key: String): String? {
+        val escapedMarker = "\\\"$key\\\":\\\""
+        val escapedStart = html.indexOf(escapedMarker)
+        if (escapedStart >= 0) {
+            val valueStart = escapedStart + escapedMarker.length
+            val valueEnd = html.indexOf("\\\"", valueStart)
+            if (valueEnd > valueStart) return html.substring(valueStart, valueEnd)
+        }
+
+        val normalizedHtml = html.replace("\\u0022", "\"")
+        val marker = "\"$key\":\""
+        val start = normalizedHtml.indexOf(marker)
+        if (start >= 0) {
+            val valueStart = start + marker.length
+            val valueEnd = normalizedHtml.indexOf('"', valueStart)
+            if (valueEnd > valueStart) return normalizedHtml.substring(valueStart, valueEnd)
+        }
+
+        return null
+    }
+
+    private fun extractCookieValue(setCookieHeaders: List<String>, name: String): String? {
+        val prefix = "$name="
+        return setCookieHeaders.firstNotNullOfOrNull { header ->
+            header.split(';')
+                .firstOrNull { it.trim().startsWith(prefix) }
+                ?.trim()
+                ?.removePrefix(prefix)
+                ?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun isValidNvCookie(value: String): Boolean = value.substringBefore('.').length >= 40
+
+    private fun randomBase64Url(size: Int): String {
+        val bytes = ByteArray(size)
+        secureRandom.nextBytes(bytes)
+        return Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+    }
+
+    private fun hmacSha256Base64Url(key: String, message: String): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(key.toByteArray(), "HmacSHA256"))
+        return Base64.encodeToString(
+            mac.doFinal(message.toByteArray()),
+            Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP,
+        )
     }
 
     override fun imageRequest(page: Page) = GET(
@@ -688,6 +847,9 @@ abstract class NTKBase(
 
     companion object {
         private val json = Json { ignoreUnknownKeys = true }
+        private val secureRandom = SecureRandom()
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         private const val PREF_DOMAIN_KEY = "pref_domain_key"
         private const val PREF_DOMAIN_DEFAULT = "3"
         const val PAGE_SIZE = 49
