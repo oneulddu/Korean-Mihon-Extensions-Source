@@ -19,7 +19,7 @@ META = {
     "source": "https://github.com/oneulddu/Korean-Mihon-Extensions-Source",
     "deploy_owner_repo": "oneulddu/Korean-Mihon-Extensions",
     "deploy_branch": "repo",
-    "signing_key": "62aaff9a192e8d3e462b352a4b435bcacc38c2390aa9c0dbf9c863942401adf0",
+    "signing_key": "b25af02d178fad20ebe739e59336f2ae5e307dcd1375418278e752dba03497cb",
     "extension_lib": "1.4",
 }
 

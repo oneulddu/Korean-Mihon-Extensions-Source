@@ -64,7 +64,7 @@ export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 현재 배포 APK 서명 키 지문:
 
 ```text
-SHA-256: 62aaff9a192e8d3e462b352a4b435bcacc38c2390aa9c0dbf9c863942401adf0
+SHA-256: b25af02d178fad20ebe739e59336f2ae5e307dcd1375418278e752dba03497cb
 ```
 
 ## 자동 배포 스크립트 구조
