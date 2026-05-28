@@ -5,7 +5,7 @@
 배포 전용 레포는 아래에 따로 둡니다.
 
 ```text
-https://github.com/oneulddu/Xtoon-Mihon-Extension
+https://github.com/oneulddu/Korean-Mihon-Extensions
 ```
 
 
@@ -30,7 +30,7 @@ xtoon
 
 ## 자동 빌드/배포
 
-`.github/workflows/build_xtoon_release.yml`가 Xtoon 확장을 빌드하고 `oneulddu/Xtoon-Mihon-Extension`의 `repo` 브랜치에 APK와 인덱스를 갱신합니다.
+`.github/workflows/build_xtoon_release.yml`가 Xtoon 확장을 빌드하고 `oneulddu/Korean-Mihon-Extensions`의 `repo` 브랜치에 APK와 인덱스를 갱신합니다.
 
 필요한 GitHub Secrets:
 

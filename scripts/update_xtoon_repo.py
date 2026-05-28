@@ -12,9 +12,9 @@ from pathlib import Path
 META = {
     "repo_name": "Xtoon Repo",
     "badge_label": "XTOON",
-    "website": "https://github.com/oneulddu/Xtoon-Mihon-Extension",
+    "website": "https://github.com/oneulddu/Korean-Mihon-Extensions",
     "source": "https://github.com/oneulddu/Korean-Mihon-Extensions-Source",
-    "deploy_owner_repo": "oneulddu/Xtoon-Mihon-Extension",
+    "deploy_owner_repo": "oneulddu/Korean-Mihon-Extensions",
     "deploy_branch": "repo",
     "signing_key": "62aaff9a192e8d3e462b352a4b435bcacc38c2390aa9c0dbf9c863942401adf0",
     "name": "Xtoon",
