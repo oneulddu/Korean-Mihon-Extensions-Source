@@ -71,6 +71,111 @@ abstract class NTKBase(
         headers = headers.newBuilder().add("X-WebView-Intercept", "true").build(),
     )
 
+    private val imageBridgeScript = """
+        (function() {
+            function sendPayloadText(text) {
+                try {
+                    const payload = JSON.parse(text);
+                    if (payload && Array.isArray(payload.images) && payload.images.length > 0) {
+                        window.TrojanTunnel.exfiltrate(JSON.stringify(payload));
+                    }
+                } catch (_) {
+                    // Ignore non-image API responses.
+                }
+            }
+
+            function absoluteUrl(src) {
+                try {
+                    return new URL(src, window.location.href).href;
+                } catch (_) {
+                    return src;
+                }
+            }
+
+            function sendImages(srcs) {
+                const seen = new Set();
+                const images = srcs
+                    .filter(Boolean)
+                    .map(absoluteUrl)
+                    .filter(src => {
+                        if (!src || seen.has(src)) return false;
+                        seen.add(src);
+                        return true;
+                    })
+                    .map(src => ({ src }));
+
+                if (images.length > 0) {
+                    window.TrojanTunnel.exfiltrate(JSON.stringify({ images }));
+                }
+            }
+
+            function requestUrl(input) {
+                if (!input) return "";
+                if (typeof input === "string") return input;
+                if (input.url) return input.url;
+                return input.toString ? input.toString() : "";
+            }
+
+            function shouldCapture(url) {
+                return /\/api\/[^?#]*images/i.test(url || "");
+            }
+
+            window.__ntkCollectPageImages = function() {
+                const pageImages = Array.from(document.querySelectorAll("img"))
+                    .filter(img => /^page\s*\d+$/i.test((img.getAttribute("alt") || "").trim()))
+                    .map(img => img.currentSrc || img.src || img.getAttribute("data-src") || img.getAttribute("src"));
+                sendImages(pageImages);
+            };
+
+            if (!window.__ntkImageBridgeInstalled) {
+                window.__ntkImageBridgeInstalled = true;
+
+                if (window.fetch) {
+                    const originalFetch = window.fetch.bind(window);
+                    window.fetch = async function() {
+                        const response = await originalFetch.apply(window, arguments);
+                        const url = requestUrl(arguments[0]);
+                        if (shouldCapture(url)) {
+                            response.clone().text().then(sendPayloadText).catch(function() {});
+                        }
+                        return response;
+                    };
+                }
+
+                if (window.XMLHttpRequest) {
+                    const originalOpen = XMLHttpRequest.prototype.open;
+                    const originalSend = XMLHttpRequest.prototype.send;
+                    XMLHttpRequest.prototype.open = function(method, url) {
+                        this.__ntkUrl = requestUrl(url);
+                        return originalOpen.apply(this, arguments);
+                    };
+                    XMLHttpRequest.prototype.send = function() {
+                        this.addEventListener("load", function() {
+                            if (shouldCapture(this.__ntkUrl)) {
+                                sendPayloadText(this.responseText || "");
+                            }
+                        });
+                        return originalSend.apply(this, arguments);
+                    };
+                }
+            }
+
+            [0, 250, 750, 1500, 3000, 5000, 8000].forEach(delay => {
+                window.setTimeout(window.__ntkCollectPageImages, delay);
+            });
+        })();
+    """.trimIndent()
+
+    private val imageBridgeCollectScript = """
+        (function() {
+            if (window.__ntkCollectPageImages) {
+                window.__ntkCollectPageImages();
+                window.setTimeout(window.__ntkCollectPageImages, 500);
+                window.setTimeout(window.__ntkCollectPageImages, 1500);
+            }
+        })();
+    """.trimIndent()
+
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     private val trojanWebViewInterceptor = Interceptor { chain ->
         val request = chain.request()
@@ -106,8 +211,10 @@ abstract class NTKBase(
                 object {
                     @JavascriptInterface
                     fun exfiltrate(html: String) {
-                        finalHtml = html
-                        latch.countDown()
+                        if (finalHtml == null && html.isNotBlank()) {
+                            finalHtml = html
+                            latch.countDown()
+                        }
                     }
                 },
                 "TrojanTunnel",
@@ -115,24 +222,16 @@ abstract class NTKBase(
 
             webView.webViewClient = object : WebViewClient() {
                 override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
-                    view.evaluateJavascript("window.__ntkDevtoolsPreflight = 1;", null)
-
-                    val wiretapScript = """
-                        const originalFetch = window.fetch;
-                        window.fetch = async function() {
-                            const response = await originalFetch.apply(this, arguments);
-                            let reqUrl = arguments[0] && arguments[0].url ? arguments[0].url : arguments[0];
-                            if (reqUrl && reqUrl.toString().match(/\/api\/(manhwa|webtoon)-images/)) {
-                                response.clone().text().then(text => {
-                                    window.TrojanTunnel.exfiltrate(text);
-                                });
-                            }
-                            return response;
-                        };
-                    """.trimIndent()
-                    view.evaluateJavascript(wiretapScript, null)
+                    view.evaluateJavascript(imageBridgeScript, null)
 
                     super.onPageStarted(view, url, favicon)
+                }
+
+                override fun onPageFinished(view: WebView, url: String) {
+                    view.evaluateJavascript(imageBridgeScript, null)
+                    view.evaluateJavascript(imageBridgeCollectScript, null)
+
+                    super.onPageFinished(view, url)
                 }
             }
 
