@@ -34,15 +34,18 @@ abstract class UpdateDomainNumberTask extends DefaultTask {
 
     @TaskAction
     void action() {
-        def domainNumber = -1
-        def response = new URL("https://nicelink52.com/").text
-        def matcher = response =~ ~/https?:\/\/wfwf(\d+)\.com/
-        if (matcher) {
-            domainNumber = matcher[0][1]
-            println("[Wolf.com] new domain number: $domainNumber")
-        } else {
-            domainNumber = defaultDomainNumber.get()
-            println("[Wolf.com] domain number not found using default: $domainNumber")
+        def domainNumber = defaultDomainNumber.get()
+        try {
+            def response = new URL("https://nicelink52.com/").text
+            def matcher = response =~ ~/https?:\/\/wfwf(\d+)\.com/
+            if (matcher) {
+                domainNumber = matcher[0][1]
+                println("[Wolf.com] new domain number: $domainNumber")
+            } else {
+                println("[Wolf.com] domain number not found using default: $domainNumber")
+            }
+        } catch (Exception e) {
+            println("[Wolf.com] domain lookup failed using default: $domainNumber (${e.class.simpleName})")
         }
 
         def domainNumberFile = outputDir.get().file("DomainNumber.kt").asFile

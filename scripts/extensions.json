@@ -1,0 +1,56 @@
+{
+  "extensions": {
+    "blacktoon": {
+      "sources": [
+        { "name": "블랙툰", "lang": "ko", "baseUrl": "https://blacktoon.me" }
+      ]
+    },
+    "manatoki": {
+      "sources": [
+        { "name": "Manatoki", "lang": "ko", "baseUrl": "https://manatoki552.net", "versionId": 2 }
+      ]
+    },
+    "navercomic": {
+      "sources": [
+        { "name": "Naver Webtoon", "lang": "ko", "baseUrl": "https://comic.naver.com" },
+        { "name": "Naver Webtoon Best Challenge", "lang": "ko", "baseUrl": "https://comic.naver.com" },
+        { "name": "Naver Webtoon Challenge", "lang": "ko", "baseUrl": "https://comic.naver.com" }
+      ]
+    },
+    "ntk": {
+      "sources": [
+        { "name": "NTK Manga", "lang": "ko", "baseUrl": "https://sbxh3.com/manhwa" },
+        { "name": "NTK Webtoon", "lang": "ko", "baseUrl": "https://sbxh3.com/ing" }
+      ]
+    },
+    "rawdex": {
+      "build": false,
+      "buildReason": "현재 축소된 소스 레포에 lib-multisrc/madara가 없어서 자동 빌드 대상에서 제외합니다.",
+      "sources": [
+        { "name": "RawDEX", "lang": "ko", "baseUrl": "https://rawdex.net" }
+      ]
+    },
+    "toon11": {
+      "sources": [
+        { "name": "11toon", "lang": "ko", "baseUrl": "https://www.11toon.com" }
+      ]
+    },
+    "toonkor": {
+      "sources": [
+        { "name": "Toonkor", "lang": "ko", "baseUrl": "https://tkor114.com" }
+      ]
+    },
+    "wolfdotcom": {
+      "sources": [
+        { "name": "늑대닷컴 - 웹툰", "lang": "ko", "baseUrl": "https://wfwf393.com" },
+        { "name": "늑대닷컴 - 만화책", "lang": "ko", "baseUrl": "https://wfwf393.com" },
+        { "name": "늑대닷컴 - 포토툰", "lang": "ko", "baseUrl": "https://wfwf393.com" }
+      ]
+    },
+    "xtoon": {
+      "sources": [
+        { "name": "Xtoon", "lang": "ko", "baseUrl": "https://t3.xtoon365.com" }
+      ]
+    }
+  }
+}

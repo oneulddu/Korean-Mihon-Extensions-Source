@@ -28,7 +28,7 @@ dependencyResolutionManagement {
 
 enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
 
-rootProject.name = "Xtoon-Mihon-Extension-Source"
+rootProject.name = "Korean-Mihon-Extensions-Source"
 
 loadAllIndividualExtensions()
 

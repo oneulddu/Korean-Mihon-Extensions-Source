@@ -30,7 +30,7 @@ xtoon
 
 ## 자동 빌드/배포
 
-`.github/workflows/build_xtoon_release.yml`가 Xtoon 확장을 빌드하고 `oneulddu/Korean-Mihon-Extensions`의 `repo` 브랜치에 APK와 인덱스를 갱신합니다.
+`.github/workflows/build_extensions_release.yml`가 한국어 확장들을 빌드하고 `oneulddu/Korean-Mihon-Extensions`의 `repo` 브랜치에 APK와 인덱스를 갱신합니다.
 
 필요한 GitHub Secrets:
 
@@ -52,7 +52,7 @@ Java와 Android SDK가 필요합니다.
 export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
 export PATH="$JAVA_HOME/bin:$PATH"
 export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
-./gradlew :src:ko:xtoon:assembleRelease
+./gradlew $(python3 scripts/list_extensions.py --gradle-tasks --extensions "xtoon ntk")
 ```
 
 ## 서명
@@ -67,19 +67,18 @@ export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 SHA-256: 62aaff9a192e8d3e462b352a4b435bcacc38c2390aa9c0dbf9c863942401adf0
 ```
 
-## 현재 구현
+## 자동 배포 스크립트 구조
 
-- 최신 목록: `/category/theme/300/order/addtime`
-- 인기 목록: `/category/theme/300/order/hits`
-- 검색: `/index.php/search?key=...`
-- 상세 정보: `/comic/{id}`
-- 회차 목록: 상세 페이지의 `.chapter-list a[href^=/chapter/]`
-- 이미지 목록: `/chapter/{id}` 페이지의 `img.lazy-read[data-original]`
-- 분류 필터: 일반웹툰, BL&GL, 성인웹툰
-- 상태 필터: 전체, 연재중, 완결
-- 요일 필터: 월, 화, 수, 목, 금, 토, 일
-- 장르 필터: 사이트에 노출된 태그 100개
-- 연결 클라이언트: Mihon/Tachiyomi `cloudflareClient` 기반, HTML 요청용 `Accept` 헤더 보정
+- `scripts/list_extensions.py`: 빌드할 확장 모듈을 찾고 Gradle task 목록을 만듭니다.
+- `scripts/update_repo.py`: 빌드된 APK들을 `index.json`, `index.min.json`, `repo.json`에 반영합니다.
+- `scripts/extensions.json`: 자동 추론이 어려운 멀티 소스 확장의 source 이름, 기본 URL, versionId를 관리합니다.
+
+예시:
+
+```bash
+python3 scripts/list_extensions.py --gradle-tasks --extensions "xtoon ntk"
+python3 scripts/update_repo.py --deploy-dir ../Korean-Mihon-Extensions --extensions "xtoon ntk"
+```
 
 ## 주의
 

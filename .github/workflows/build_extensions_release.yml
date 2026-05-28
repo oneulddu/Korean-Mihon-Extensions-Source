@@ -1,25 +1,32 @@
-name: Build and publish Xtoon
+name: Build and publish Korean extensions
 
 on:
   workflow_dispatch:
+    inputs:
+      extensions:
+        description: 'all 또는 빌드할 모듈명 목록 예: xtoon ntk'
+        required: false
+        default: all
   push:
     branches:
       - main
     paths:
-      - 'src/ko/xtoon/**'
+      - 'src/**'
       - 'core/**'
       - 'common/**'
       - 'gradle/**'
       - 'build.gradle.kts'
       - 'settings.gradle.kts'
-      - 'scripts/update_xtoon_repo.py'
-      - '.github/workflows/build_xtoon_release.yml'
+      - 'scripts/**'
+      - '.github/workflows/build_extensions_release.yml'
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      EXTENSIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.extensions || 'all' }}
 
     steps:
       - name: Checkout source
@@ -44,14 +51,25 @@ jobs:
           fi
           echo "$SIGNING_KEYSTORE_BASE64" | base64 --decode > signingkey.jks
 
-      - name: Build Xtoon release APK
+      - name: Resolve extension build tasks
+        id: tasks
+        run: |
+          TASKS=$(python3 scripts/list_extensions.py --gradle-tasks --extensions "$EXTENSIONS")
+          if [ -z "$TASKS" ]; then
+            echo "No extension build tasks resolved" >&2
+            exit 1
+          fi
+          echo "tasks=$TASKS" >> "$GITHUB_OUTPUT"
+          echo "Resolved tasks: $TASKS"
+
+      - name: Build release APKs
         env:
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           ALIAS: ${{ secrets.ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           chmod +x ./gradlew
-          ./gradlew :src:ko:xtoon:assembleRelease
+          ./gradlew ${{ steps.tasks.outputs.tasks }}
 
       - name: Checkout deployment repository
         uses: actions/checkout@v4
@@ -63,11 +81,10 @@ jobs:
 
       - name: Update deployment repository files
         run: |
-          APK_PATH=$(find src/ko/xtoon/build/outputs/apk/release -name 'tachiyomi-ko.xtoon-v*-release.apk' | sort | tail -n 1)
-          python3 scripts/update_xtoon_repo.py \
+          python3 scripts/update_repo.py \
             --source-dir "$GITHUB_WORKSPACE" \
             --deploy-dir "$GITHUB_WORKSPACE/deploy" \
-            --apk "$APK_PATH"
+            --extensions "$EXTENSIONS"
 
       - name: Commit and push deployment repository
         run: |
@@ -79,5 +96,5 @@ jobs:
             echo "No deployment changes"
             exit 0
           fi
-          git commit -m "chore: Xtoon 배포 갱신"
+          git commit -m "chore: 한국어 확장 배포 갱신"
           git push origin repo
