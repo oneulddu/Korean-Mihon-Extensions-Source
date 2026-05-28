@@ -28,7 +28,32 @@ dependencyResolutionManagement {
 
 enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
 
-rootProject.name = "Xtoon-Mihon-Extension"
+rootProject.name = "Xtoon-Mihon-Extension-Source"
+
+loadAllIndividualExtensions()
 
 include(":core")
-include(":src:ko:xtoon")
+
+File(rootDir, "lib").eachDir { include("lib:${it.name}") }
+File(rootDir, "lib-multisrc").eachDir { include("lib-multisrc:${it.name}") }
+
+fun loadAllIndividualExtensions() {
+    File(rootDir, "src").eachDir { dir ->
+        dir.eachDir { subdir ->
+            include("src:${dir.name}:${subdir.name}")
+        }
+    }
+}
+
+fun loadIndividualExtension(lang: String, name: String) {
+    include("src:$lang:$name")
+}
+
+fun File.eachDir(block: (File) -> Unit) {
+    val files = listFiles() ?: return
+    for (file in files) {
+        if (file.isDirectory && file.name != ".gradle" && file.name != "build") {
+            block(file)
+        }
+    }
+}

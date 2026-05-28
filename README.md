@@ -8,6 +8,25 @@
 https://github.com/oneulddu/Xtoon-Mihon-Extension
 ```
 
+
+## 포함한 한국어 확장
+
+Keiyoushi `extensions-source` PR #15649 기준 한국어 확장들을 함께 가져왔습니다.
+
+```text
+blacktoon
+manatoki
+navercomic
+ntk
+rawdex
+toon11
+toonkor
+wolfdotcom
+xtoon
+```
+
+`newtoki` 이름으로 남아 있는 최종 디렉터리는 없고, 해당 PR 최종 상태에서는 `ntk` 패키지로 정리되어 있습니다.
+
 ## 빌드
 
 Java와 Android SDK가 필요합니다.
