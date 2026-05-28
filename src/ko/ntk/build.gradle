@@ -1,7 +1,7 @@
 ext {
     extName = 'NTK'
     extClass = '.NTKFactory'
-    extVersionCode = 5
+    extVersionCode = 6
     isNsfw = true
 }
 apply plugin: "kei.plugins.extension.legacy"

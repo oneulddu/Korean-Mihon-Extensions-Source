@@ -79,7 +79,10 @@ abstract class NTKBase(
     override fun mangaDetailsRequest(manga: SManga) = GET(rootUrl + manga.url, headers)
     override fun chapterListRequest(manga: SManga) = GET(rootUrl + manga.url, headers)
 
-    override fun pageListRequest(chapter: SChapter) = GET(rootUrl + chapter.url, headers)
+    override fun pageListRequest(chapter: SChapter) = GET(
+        rootUrl + chapter.url,
+        headers.newBuilder().add(WEBVIEW_HTML_FALLBACK_HEADER, "true").build(),
+    )
 
     private val imageBridgeScript = """
         (function() {
@@ -301,6 +304,34 @@ abstract class NTKBase(
     private val trojanWebViewInterceptor = Interceptor { chain ->
         val request = chain.request()
 
+        if (request.header(WEBVIEW_HTML_FALLBACK_HEADER) != null) {
+            val cleanRequest = request.newBuilder()
+                .removeHeader(WEBVIEW_HTML_FALLBACK_HEADER)
+                .build()
+            val response = chain.proceed(cleanRequest)
+            val preview = response.peekBody(1_000_000).string()
+            val shouldOpenWebView = response.code in CLOUDFLARE_ERROR_CODES ||
+                isCloudflareChallengeHtml(preview) ||
+                extractHtmlString(preview, "imagesToken") == null
+
+            if (!shouldOpenWebView) {
+                return@Interceptor response
+            }
+
+            response.close()
+            loadChapterHtmlWithWebView(cleanRequest)?.let { html ->
+                return@Interceptor Response.Builder()
+                    .request(cleanRequest)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(html.toResponseBody(HTML_MEDIA_TYPE))
+                    .build()
+            }
+
+            return@Interceptor chain.proceed(cleanRequest)
+        }
+
         if (request.header("X-WebView-Intercept") == null) {
             return@Interceptor chain.proceed(request)
         }
@@ -470,6 +501,89 @@ abstract class NTKBase(
         }
 
         throw Exception("WebView timed out loading ${request.url}")
+    }
+
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
+    private fun loadChapterHtmlWithWebView(request: Request): String? {
+        val finalHtml = AtomicReference<String?>(null)
+        val isComplete = AtomicBoolean(false)
+        val latch = CountDownLatch(1)
+        val handler = Handler(Looper.getMainLooper())
+
+        fun completeWith(html: String) {
+            if (
+                html.isBlank() ||
+                isCloudflareChallengeHtml(html) ||
+                extractHtmlString(html, "imagesToken") == null
+            ) {
+                return
+            }
+            if (isComplete.compareAndSet(false, true)) {
+                finalHtml.set(html)
+                latch.countDown()
+            }
+        }
+
+        handler.post {
+            val context = Injekt.get<Application>()
+            val webView = WebView(context)
+
+            webView.settings.javaScriptEnabled = true
+            webView.settings.domStorageEnabled = true
+            webView.settings.loadsImagesAutomatically = true
+            webView.settings.blockNetworkImage = false
+            webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+            webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            webView.settings.userAgentString = request.header("User-Agent") ?: DEFAULT_USER_AGENT
+
+            android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+
+            webView.addJavascriptInterface(
+                object {
+                    @JavascriptInterface
+                    fun collectHtml(html: String) {
+                        completeWith(html)
+                    }
+                },
+                "NTKHtmlBridge",
+            )
+
+            fun collectHtmlFromPage() {
+                webView.evaluateJavascript(
+                    """
+                        (function() {
+                            try {
+                                window.NTKHtmlBridge.collectHtml(document.documentElement.outerHTML || '');
+                            } catch (_) {}
+                        })();
+                    """.trimIndent(),
+                    null,
+                )
+            }
+
+            webView.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView, url: String) {
+                    collectHtmlFromPage()
+                    handler.postDelayed({ collectHtmlFromPage() }, 3_000)
+                    handler.postDelayed({ collectHtmlFromPage() }, 8_000)
+                    handler.postDelayed({ collectHtmlFromPage() }, 16_000)
+                    super.onPageFinished(view, url)
+                }
+            }
+
+            val requestHeaders = request.headers.toMultimap()
+                .filterKeys { it.equals("Host", ignoreCase = true).not() }
+                .mapValues { it.value.joinToString(",") }
+
+            webView.loadUrl(request.url.toString(), requestHeaders)
+            handler.postDelayed({ collectHtmlFromPage() }, 5_000)
+            handler.postDelayed({ collectHtmlFromPage() }, 12_000)
+            handler.postDelayed({ collectHtmlFromPage() }, 24_000)
+        }
+
+        latch.await(28, TimeUnit.SECONDS)
+        return finalHtml.get()
     }
 
     private val headerCleanerInterceptor = Interceptor { chain ->
@@ -680,7 +794,7 @@ abstract class NTKBase(
             ?: throw Exception("NTK image API failed: missing episode id from $referer")
 
         val html = response.body.string()
-        if (html.contains("challenge-platform") || html.contains("cf-mitigated") || html.contains("보안 확인 수행 중")) {
+        if (isCloudflareChallengeHtml(html)) {
             throw Exception("NTK image API failed: Cloudflare challenge page was returned for $referer")
         }
 
@@ -707,51 +821,75 @@ abstract class NTKBase(
         referer: String,
     ): PageImagesResponse {
         val userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
-        val nonce = randomBase64Url(24)
-        val proof = hmacSha256Base64Url(nvCookie, "$imagesToken.$nonce.$userAgent")
-        val body = json.encodeToString(
-            ImageApiRequest(
-                workId = workId,
-                episodeId = episodeId,
-                token = imagesToken,
-                nonce = nonce,
-                proof = proof,
-            ),
-        ).toRequestBody(JSON_MEDIA_TYPE)
 
-        val request = Request.Builder()
-            .url("$rootUrl/api/$contentKind-images")
-            .headers(
-                headers.newBuilder()
-                    .set("Accept", "application/json")
-                    .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
-                    .set("Cache-Control", "no-store")
-                    .set("Content-Type", "application/json")
-                    .set("Origin", rootUrl)
-                    .set("Referer", referer)
-                    .set("User-Agent", userAgent)
-                    .set("x-images-client", "viewer-v1")
-                    .build(),
-            )
-            .post(body)
-            .build()
+        fun buildRequest(): Request {
+            val nonce = randomBase64Url(24)
+            val proof = hmacSha256Base64Url(nvCookie, "$imagesToken.$nonce.$userAgent")
+            val body = json.encodeToString(
+                ImageApiRequest(
+                    workId = workId,
+                    episodeId = episodeId,
+                    token = imagesToken,
+                    nonce = nonce,
+                    proof = proof,
+                ),
+            ).toRequestBody(JSON_MEDIA_TYPE)
 
-        client.newCall(request).execute().use { apiResponse ->
-            val responseBody = apiResponse.body.string()
-            if (!apiResponse.isSuccessful) {
-                throw Exception("NTK image API failed: HTTP ${apiResponse.code} for $referer: ${responseBody.take(500)}")
+            return Request.Builder()
+                .url("$rootUrl/api/$contentKind-images")
+                .headers(
+                    headers.newBuilder()
+                        .set("Accept", "application/json")
+                        .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+                        .set("Cache-Control", "no-store")
+                        .set("Content-Type", "application/json")
+                        .set("Origin", rootUrl)
+                        .set("Referer", referer)
+                        .set("User-Agent", userAgent)
+                        .set("x-images-client", "viewer-v1")
+                        .build(),
+                )
+                .post(body)
+                .build()
+        }
+
+        client.newCall(buildRequest()).execute().use { firstResponse ->
+            val firstBody = firstResponse.body.string()
+            if (isCloudflareApiResponse(firstResponse.code, firstBody)) {
+                warmUpCloudflare(referer)
+                client.newCall(buildRequest()).execute().use { retryResponse ->
+                    return parseImageApiResponse(
+                        retryResponse.code,
+                        retryResponse.isSuccessful,
+                        retryResponse.body.string(),
+                        referer,
+                    )
+                }
             }
-            return runCatching {
-                json.decodeFromString<PageImagesResponse>(responseBody)
-            }.getOrElse { error ->
-                throw Exception("NTK image API failed: invalid image JSON for $referer: ${responseBody.take(500)}", error)
-            }
+            return parseImageApiResponse(firstResponse.code, firstResponse.isSuccessful, firstBody, referer)
+        }
+    }
+
+    private fun parseImageApiResponse(
+        code: Int,
+        isSuccessful: Boolean,
+        responseBody: String,
+        referer: String,
+    ): PageImagesResponse {
+        if (!isSuccessful) {
+            throw Exception("NTK image API failed: HTTP $code for $referer: ${responseBody.take(500)}")
+        }
+        return runCatching {
+            json.decodeFromString<PageImagesResponse>(responseBody)
+        }.getOrElse { error ->
+            throw Exception("NTK image API failed: invalid image JSON for $referer: ${responseBody.take(500)}", error)
         }
     }
 
     private fun issueNvCookie(referer: String): String {
         val userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
-        val request = Request.Builder()
+
+        fun buildRequest() = Request.Builder()
             .url("$rootUrl/api/nv-issue")
             .headers(
                 headers.newBuilder()
@@ -766,14 +904,49 @@ abstract class NTKBase(
             .post("".toRequestBody(null))
             .build()
 
-        client.newCall(request).execute().use { nvResponse ->
-            val nv = extractCookieValue(nvResponse.headers("Set-Cookie"), "nv")
-            if (nvResponse.isSuccessful && nv != null && isValidNvCookie(nv)) {
+        client.newCall(buildRequest()).execute().use { firstResponse ->
+            val nv = extractCookieValue(firstResponse.headers("Set-Cookie"), "nv")
+            if (firstResponse.isSuccessful && nv != null && isValidNvCookie(nv)) {
                 return nv
             }
-            val errorBody = nvResponse.body.string().take(500)
-            throw Exception("NTK image API failed: nv cookie issue failed with HTTP ${nvResponse.code}: $errorBody")
+
+            val firstBody = firstResponse.body.string()
+            if (isCloudflareApiResponse(firstResponse.code, firstBody)) {
+                warmUpCloudflare(referer)
+                client.newCall(buildRequest()).execute().use { retryResponse ->
+                    val retryNv = extractCookieValue(retryResponse.headers("Set-Cookie"), "nv")
+                    if (retryResponse.isSuccessful && retryNv != null && isValidNvCookie(retryNv)) {
+                        return retryNv
+                    }
+                    val retryBody = retryResponse.body.string().take(500)
+                    throw Exception(
+                        "NTK image API failed: nv cookie issue failed with HTTP ${retryResponse.code}: $retryBody",
+                    )
+                }
+            }
+
+            throw Exception(
+                "NTK image API failed: nv cookie issue failed with HTTP ${firstResponse.code}: ${firstBody.take(500)}",
+            )
         }
+    }
+
+    private fun warmUpCloudflare(referer: String) {
+        val userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
+        val request = Request.Builder()
+            .url(referer)
+            .headers(
+                headers.newBuilder()
+                    .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                    .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+                    .set("Referer", rootUrl)
+                    .set("User-Agent", userAgent)
+                    .build(),
+            )
+            .get()
+            .build()
+
+        loadChapterHtmlWithWebView(request)
     }
 
     private fun extractHtmlString(html: String, key: String): String? {
@@ -795,6 +968,22 @@ abstract class NTKBase(
         }
 
         return null
+    }
+
+    private fun isCloudflareChallengeHtml(html: String): Boolean {
+        val lower = html.lowercase(Locale.US)
+        return "challenge-platform" in lower ||
+            "cf-mitigated" in lower ||
+            "just a moment" in lower ||
+            "보안 확인 수행 중" in html
+    }
+
+    private fun isCloudflareApiResponse(code: Int, body: String): Boolean {
+        val trimmed = body.trimStart()
+        return code in CLOUDFLARE_ERROR_CODES ||
+            isCloudflareChallengeHtml(body) ||
+            trimmed.startsWith("<!DOCTYPE", ignoreCase = true) ||
+            trimmed.startsWith("<html", ignoreCase = true)
     }
 
     private fun extractCookieValue(setCookieHeaders: List<String>, name: String): String? {
@@ -849,6 +1038,9 @@ abstract class NTKBase(
         private val json = Json { ignoreUnknownKeys = true }
         private val secureRandom = SecureRandom()
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private val HTML_MEDIA_TYPE = "text/html; charset=utf-8".toMediaType()
+        private val CLOUDFLARE_ERROR_CODES = listOf(403, 503)
+        private const val WEBVIEW_HTML_FALLBACK_HEADER = "X-WebView-Html-Fallback"
         private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         private const val PREF_DOMAIN_KEY = "pref_domain_key"
         private const val PREF_DOMAIN_DEFAULT = "3"
