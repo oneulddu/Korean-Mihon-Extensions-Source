@@ -1,6 +1,6 @@
-# Xtoon Mihon Extension Source
+# Korean Mihon Extensions Source
 
-`https://t3.xtoon365.com` 공개 페이지를 대상으로 하는 Mihon/Tachiyomi 확장 소스 레포입니다.
+한국어 Mihon/Tachiyomi 확장을 모아 수정하기 위한 소스 레포입니다.
 
 배포 전용 레포는 아래에 따로 둡니다.
 
