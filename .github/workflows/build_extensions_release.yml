@@ -15,6 +15,7 @@ on:
       - 'core/**'
       - 'common/**'
       - 'lib/**'
+      - 'lib-multisrc/**'
       - 'gradle/**'
       - 'build.gradle.kts'
       - 'settings.gradle.kts'
