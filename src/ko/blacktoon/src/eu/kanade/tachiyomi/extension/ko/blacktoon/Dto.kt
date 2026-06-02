@@ -11,7 +11,7 @@ import java.util.Locale
 @Serializable
 class SeriesItem(
     @SerialName("x")
-    private val id: String,
+    val id: String,
     @SerialName("t")
     val name: String,
     @SerialName("p")
@@ -24,7 +24,7 @@ class SeriesItem(
     private val tagIds: String = "",
     @SerialName("c")
     private val platformId: String = "-1",
-    @SerialName("d")
+    @SerialName("pd")
     private val publishDayId: String = "-1",
     @SerialName("h")
     val hot: Int = 0,
@@ -69,9 +69,14 @@ class Chapter(
     val title: String,
     @SerialName("d")
     val date: String = "",
+    @SerialName("u")
+    private val url: String = "",
 ) {
     fun toSChapter(mangaId: String) = SChapter.create().apply {
-        url = "$mangaId/$id"
+        url = this@Chapter.url
+            .removePrefix("/webtoons/")
+            .removeSuffix(".html")
+            .ifBlank { "$mangaId/$id" }
         name = title
         date_upload = try {
             dateFormat.parse(date)!!.time

@@ -10,13 +10,13 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import okio.IOException
 import rx.Observable
 import uy.kohesive.injekt.injectLazy
-import kotlin.math.min
 import kotlin.random.Random
 
 class BlackToon : HttpSource() {
@@ -28,9 +28,13 @@ class BlackToon : HttpSource() {
     private var currentBaseUrlHost = ""
     override val baseUrl = "https://blacktoon.me"
 
-    private val cdnUrl = "https://blacktoonimg.com/"
+    private val cdnUrl = "https://webimg7.com/"
 
     override val supportsLatest = true
+
+    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
+        .set("User-Agent", USER_AGENT)
+        .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 
     override val client = network.client.newBuilder().addInterceptor { chain ->
         if (currentBaseUrlHost.isBlank()) {
@@ -62,10 +66,17 @@ class BlackToon : HttpSource() {
     private val json by injectLazy<Json>()
 
     private val db by lazy {
-        val doc = client.newCall(GET(baseUrl, headers)).execute().asJsoup()
-        doc.select("script[src*=data/webtoon]").flatMap { scriptEl ->
+        val response = client.newCall(GET(baseUrl, headers)).execute()
+        val body = response.body.string()
+        val dataScriptUrls = dataScriptRegex.findAll(body)
+            .map { it.groupValues[1] }
+            .distinct()
+            .toList()
+            .ifEmpty { throw IOException("unable to find webtoon data scripts") }
+
+        dataScriptUrls.flatMap { scriptUrl ->
             var listIdx: Int
-            client.newCall(GET(scriptEl.absUrl("src"), headers))
+            client.newCall(GET("$baseUrl$scriptUrl", headers))
                 .execute().body.string()
                 .also {
                     listIdx = it.substringBefore(" = ")
@@ -80,9 +91,9 @@ class BlackToon : HttpSource() {
     }
 
     private fun List<SeriesItem>.getPageChunk(page: Int): MangasPage = MangasPage(
-        mangas = subList((page - 1) * 24, min(page * 24, size))
+        mangas = drop((page - 1) * 24).take(24)
             .map { it.toSManga(cdnUrl) },
-        hasNextPage = (page + 1) * 24 <= size,
+        hasNextPage = page * 24 < size,
     )
 
     override fun fetchPopularManga(page: Int): Observable<MangasPage> = Observable.just(
@@ -131,12 +142,11 @@ class BlackToon : HttpSource() {
 
     override fun mangaDetailsParse(response: Response): SManga {
         val doc = response.asJsoup()
-        return SManga.create().apply {
+        val mangaId = response.request.url.pathSegments.last().removeSuffix(".html")
+
+        return (runCatching { db.firstOrNull { it.id == mangaId }?.toSManga(cdnUrl) }.getOrNull() ?: SManga.create()).apply {
             description = doc.select("p.mt-2").last()?.text()
-            thumbnail_url = doc.selectFirst("script:containsData(+img_domain+)")?.data()?.let {
-                cdnUrl + it.substringAfter("+'").substringBefore("'+")
-            }
-            status = response.request.url.fragment!!.toInt()
+            status = response.request.url.fragment?.toIntOrNull() ?: status
         }
     }
 
@@ -174,9 +184,21 @@ class BlackToon : HttpSource() {
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
 
-        return document.select("#toon_content_imgs img").map {
-            Page(0, imageUrl = cdnUrl + it.attr("o_src"))
+        return document.select("#toon_content_imgs img").mapIndexed { index, element ->
+            val imageUrl = element.attr("data-original")
+                .ifBlank { element.attr("o_src") }
+                .ifBlank { element.attr("src") }
+                .toImageUrl()
+
+            Page(index, imageUrl = imageUrl)
         }
+    }
+
+    private fun String.toImageUrl(): String = when {
+        startsWith("http") -> this
+        startsWith("//") -> "https:$this"
+        startsWith("/") -> "https://$currentBaseUrlHost$this"
+        else -> cdnUrl + this
     }
 
     // unused
@@ -187,4 +209,10 @@ class BlackToon : HttpSource() {
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = throw UnsupportedOperationException()
     override fun searchMangaParse(response: Response): MangasPage = throw UnsupportedOperationException()
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
+    companion object {
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        private val dataScriptRegex = Regex("""loadScript\(['"](/data/webtoon/webtoon_\d+_\d+\.js)""")
+    }
 }
