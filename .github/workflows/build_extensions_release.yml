@@ -96,5 +96,10 @@ jobs:
             echo "No deployment changes"
             exit 0
           fi
-          git commit -m "chore: 한국어 확장 배포 갱신"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          SOURCE_REF="${GITHUB_REF_NAME:-unknown}"
+          git commit \
+            -m "chore: 한국어 확장 배포 갱신 (${SOURCE_REF}@${SHORT_SHA})" \
+            -m "Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}" \
+            -m "Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git push origin repo
