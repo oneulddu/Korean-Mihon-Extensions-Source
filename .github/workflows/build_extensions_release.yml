@@ -98,8 +98,13 @@ jobs:
           fi
           SHORT_SHA="${GITHUB_SHA::7}"
           SOURCE_REF="${GITHUB_REF_NAME:-unknown}"
+          SOURCE_COMMIT_SUBJECT="$(git -C "$GITHUB_WORKSPACE" log -1 --pretty=%s "$GITHUB_SHA")"
+          if [ -z "$SOURCE_COMMIT_SUBJECT" ]; then
+            SOURCE_COMMIT_SUBJECT="chore: 한국어 확장 배포 갱신"
+          fi
           git commit \
-            -m "chore: 한국어 확장 배포 갱신 (${SOURCE_REF}@${SHORT_SHA})" \
+            -m "$SOURCE_COMMIT_SUBJECT" \
+            -m "Deploy: ${SOURCE_REF}@${SHORT_SHA}" \
             -m "Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}" \
             -m "Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git push origin repo
