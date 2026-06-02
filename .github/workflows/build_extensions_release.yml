@@ -31,6 +31,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -54,15 +56,28 @@ jobs:
       - name: Resolve extension build tasks
         id: tasks
         run: |
-          TASKS=$(python3 scripts/list_extensions.py --gradle-tasks --extensions "$EXTENSIONS")
-          if [ -z "$TASKS" ]; then
-            echo "No extension build tasks resolved" >&2
-            exit 1
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SELECTED_EXTENSIONS=$(python3 scripts/list_extensions.py --names --extensions "$EXTENSIONS")
+            TASKS=$(python3 scripts/list_extensions.py --gradle-tasks --extensions "$EXTENSIONS")
+          else
+            SELECTED_EXTENSIONS=$(python3 scripts/list_extensions.py --names --changed-from "${{ github.event.before }}" --changed-to "${{ github.sha }}")
+            TASKS=$(python3 scripts/list_extensions.py --gradle-tasks --changed-from "${{ github.event.before }}" --changed-to "${{ github.sha }}")
           fi
+
+          if [ -z "$TASKS" ]; then
+            echo "No changed extensions to build"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "selected_extensions=$SELECTED_EXTENSIONS" >> "$GITHUB_OUTPUT"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
           echo "tasks=$TASKS" >> "$GITHUB_OUTPUT"
+          echo "Selected extensions: $SELECTED_EXTENSIONS"
           echo "Resolved tasks: $TASKS"
 
       - name: Build release APKs
+        if: steps.tasks.outputs.should_build == 'true'
         env:
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           ALIAS: ${{ secrets.ALIAS }}
@@ -72,6 +87,7 @@ jobs:
           ./gradlew ${{ steps.tasks.outputs.tasks }}
 
       - name: Checkout deployment repository
+        if: steps.tasks.outputs.should_build == 'true'
         uses: actions/checkout@v4
         with:
           repository: oneulddu/Korean-Mihon-Extensions
@@ -80,13 +96,15 @@ jobs:
           token: ${{ secrets.DEPLOY_TOKEN }}
 
       - name: Update deployment repository files
+        if: steps.tasks.outputs.should_build == 'true'
         run: |
           python3 scripts/update_repo.py \
             --source-dir "$GITHUB_WORKSPACE" \
             --deploy-dir "$GITHUB_WORKSPACE/deploy" \
-            --extensions "$EXTENSIONS"
+            --extensions "${{ steps.tasks.outputs.selected_extensions }}"
 
       - name: Commit and push deployment repository
+        if: steps.tasks.outputs.should_build == 'true'
         run: |
           cd deploy
           git config user.name "github-actions[bot]"

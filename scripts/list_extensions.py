@@ -6,8 +6,21 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
+
+SHARED_PATH_PREFIXES = (
+    "common/",
+    "core/",
+    "gradle/",
+    "lib-multisrc/",
+)
+
+SHARED_PATHS = {
+    "build.gradle.kts",
+    "settings.gradle.kts",
+}
 
 
 def load_config(source_dir: Path) -> dict:
@@ -39,6 +52,30 @@ def parse_requested(value: str, known: set[str]) -> set[str]:
     return {item for item in re.split(r"[\s,]+", normalized) if item}
 
 
+def list_changed_files(source_dir: Path, base: str, head: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "diff", "--name-only", f"{base}..{head}"],
+        cwd=source_dir,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def parse_changed_extensions(changed_files: list[str], known: set[str]) -> set[str]:
+    selected: set[str] = set()
+    for path in changed_files:
+        if path in SHARED_PATHS or path.startswith(SHARED_PATH_PREFIXES):
+            return set(known)
+
+        parts = path.split("/")
+        if len(parts) >= 3 and parts[0] == "src" and parts[2] in known:
+            selected.add(parts[2])
+
+    return selected
+
+
 def is_buildable(source_dir: Path, module: str, build_file: Path, config: dict, explicit: bool) -> tuple[bool, str | None]:
     ext_config = config.get("extensions", {}).get(module, {})
     if ext_config.get("build") is False and not explicit:
@@ -56,6 +93,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-dir", type=Path, default=Path.cwd())
     parser.add_argument("--extensions", default="all", help="all 또는 공백/쉼표로 구분한 모듈명")
+    parser.add_argument("--changed-from", help="변경 확장을 계산할 기준 커밋")
+    parser.add_argument("--changed-to", help="변경 확장을 계산할 대상 커밋")
     parser.add_argument("--gradle-tasks", action="store_true")
     parser.add_argument("--names", action="store_true")
     args = parser.parse_args()
@@ -64,12 +103,22 @@ def main() -> None:
     config = load_config(source_dir)
     discovered = discover_extensions(source_dir)
     known = {module for _, module, _ in discovered}
-    requested = parse_requested(args.extensions, known)
+
+    if args.changed_from or args.changed_to:
+        if not args.changed_from or not args.changed_to:
+            raise SystemExit("--changed-from and --changed-to must be used together")
+        requested = parse_changed_extensions(
+            list_changed_files(source_dir, args.changed_from, args.changed_to),
+            known,
+        )
+    else:
+        requested = parse_requested(args.extensions, known)
+
     unknown = requested - known
     if unknown:
         raise SystemExit(f"Unknown extension module(s): {', '.join(sorted(unknown))}")
 
-    explicit = args.extensions.strip().lower() != "all"
+    explicit = not (args.changed_from or args.changed_to) and args.extensions.strip().lower() != "all"
     selected: list[tuple[str, str]] = []
     skipped: list[str] = []
     for lang, module, build_file in discovered:
