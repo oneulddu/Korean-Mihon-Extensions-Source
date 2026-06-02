@@ -67,6 +67,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+          cache: gradle
 
       - name: Set up Android SDK
         if: steps.tasks.outputs.should_build == 'true'
@@ -91,7 +92,7 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           chmod +x ./gradlew
-          ./gradlew ${{ steps.tasks.outputs.tasks }}
+          ./gradlew --no-daemon ${{ steps.tasks.outputs.tasks }}
 
       - name: Checkout deployment repository
         if: steps.tasks.outputs.should_build == 'true'
