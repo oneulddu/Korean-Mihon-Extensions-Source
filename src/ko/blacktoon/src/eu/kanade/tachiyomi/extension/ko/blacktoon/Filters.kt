@@ -67,7 +67,7 @@ class PublishDayFilter :
         },
     ),
     ListFilter {
-    override fun applyFilter(list: List<SeriesItem>): List<SeriesItem> = list.filter { selected == -1 || it.publishDay == state }
+    override fun applyFilter(list: List<SeriesItem>): List<SeriesItem> = list.filter { selected == -1 || it.publishDay == selected }
 }
 
 class Status :
