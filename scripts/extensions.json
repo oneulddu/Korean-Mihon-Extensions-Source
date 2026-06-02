@@ -24,8 +24,6 @@
       ]
     },
     "rawdex": {
-      "build": false,
-      "buildReason": "현재 축소된 소스 레포에 lib-multisrc/madara가 없어서 자동 빌드 대상에서 제외합니다.",
       "sources": [
         { "name": "RawDEX", "lang": "ko", "baseUrl": "https://rawdex.net" }
       ]

@@ -14,6 +14,8 @@ on:
       - 'src/**'
       - 'core/**'
       - 'common/**'
+      - 'lib/**'
+      - 'lib-multisrc/**'
       - 'gradle/**'
       - 'build.gradle.kts'
       - 'settings.gradle.kts'
@@ -90,6 +92,7 @@ jobs:
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           ALIAS: ${{ secrets.ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          CI_SELECTED_EXTENSIONS: ${{ steps.tasks.outputs.selected_extensions }}
         run: |
           chmod +x ./gradlew
           ./gradlew --no-daemon ${{ steps.tasks.outputs.tasks }}

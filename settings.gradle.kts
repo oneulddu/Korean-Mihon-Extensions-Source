@@ -30,16 +30,25 @@ enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
 
 rootProject.name = "Korean-Mihon-Extensions-Source"
 
-loadAllIndividualExtensions()
+loadSelectedIndividualExtensions()
 
 include(":core")
 
 File(rootDir, "lib").eachDir { include("lib:${it.name}") }
 File(rootDir, "lib-multisrc").eachDir { include("lib-multisrc:${it.name}") }
 
-fun loadAllIndividualExtensions() {
+fun loadSelectedIndividualExtensions() {
+    val selectedExtensions = providers.environmentVariable("CI_SELECTED_EXTENSIONS").orNull
+        ?.split(Regex("""[\s,]+"""))
+        ?.filter { it.isNotBlank() && it != "all" }
+        ?.toSet()
+        .orEmpty()
+
     File(rootDir, "src").eachDir { dir ->
         dir.eachDir { subdir ->
+            if (selectedExtensions.isNotEmpty() && subdir.name !in selectedExtensions) {
+                return@eachDir
+            }
             include("src:${dir.name}:${subdir.name}")
         }
     }
