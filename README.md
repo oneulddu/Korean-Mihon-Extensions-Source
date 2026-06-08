@@ -27,7 +27,7 @@ Mihon URL → https://raw.githubusercontent.com/oneulddu/Korean-Mihon-Extensions
 ## 📦 포함 확장
 
 Keiyoushi `extensions-source` PR #15649 기준 한국어 확장들을 함께 가져왔습니다.
-소스에는 9개 확장이 있으며, 이 중 배포 레포에 올라가는 확장은 ✅로 표시했습니다.
+소스의 9개 확장 모두 배포 레포(`repo` 브랜치)로 배포됩니다.
 
 | 확장 | 디렉터리 (`src/ko/…`) | 배포 |
 | :--- | :--- | :--: |
@@ -36,10 +36,10 @@ Keiyoushi `extensions-source` PR #15649 기준 한국어 확장들을 함께 가
 | Manatoki | `manatoki` | ✅ |
 | Naver Comic | `navercomic` | ✅ |
 | NTK | `ntk` | ✅ |
+| RawDEX | `rawdex` | ✅ |
 | Toonkor | `toonkor` | ✅ |
 | Wolf.com | `wolfdotcom` | ✅ |
 | Xtoon | `xtoon` | ✅ |
-| RawDex | `rawdex` | — |
 
 > `newtoki` 이름으로 남아 있는 최종 디렉터리는 없고, 해당 PR 최종 상태에서는 `ntk` 패키지로 정리되어 있습니다.
 
