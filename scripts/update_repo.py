@@ -258,89 +258,6 @@ def read_existing_modern(deploy_dir: Path) -> dict[str, dict[str, Any]]:
     return {entry["packageName"]: entry for entry in entries if isinstance(entry, dict) and "packageName" in entry}
 
 
-def write_readme(deploy_dir: Path, legacy_entries: list[dict[str, Any]]) -> None:
-    apk_lines = "\n".join(f"- `{entry['name'].removeprefix('Tachiyomi: ')}`: `apk/{entry['apk']}`" for entry in legacy_entries)
-    if not apk_lines:
-        apk_lines = "- 아직 배포된 APK가 없습니다."
-
-    readme = f"""# Korean Mihon Extensions Repo
-
-한국어 Mihon/Tachiyomi 확장 배포 전용 저장소입니다.
-
-## Mihon 저장소 추가 URL
-
-Keiyoushi 배포 레포처럼 `{META['deploy_branch']}` 브랜치를 배포 브랜치로 사용합니다.
-
-```text
-https://raw.githubusercontent.com/{META['deploy_owner_repo']}/{META['deploy_branch']}/index.min.json
-```
-
-## 배포 파일
-
-{apk_lines}
-
-- 구형 저장소 목록: `index.min.json`
-- 신형 저장소 목록: `index.json`
-- 저장소 정보: `repo.json`
-
-## 소스 코드
-
-확장 소스와 Gradle 빌드 환경은 별도 레포로 분리했습니다.
-
-```text
-{META['source']}
-```
-
-## 서명 정보
-
-현재 APK는 release 키로 서명되어 있습니다.
-
-```text
-SHA-256: {META['signing_key']}
-```
-
-`signingkey.jks`와 `signing.env`는 Git에 올리지 않고 별도로 보관합니다.
-
-## GitHub Actions
-
-자동 빌드/자동 인덱스 갱신은 소스 레포에서 관리합니다.
-
-```text
-{META['source']}/actions/workflows/build_extensions_release.yml
-```
-
-해당 workflow가 한국어 확장 APK를 빌드하고 이 레포의 `{META['deploy_branch']}` 브랜치에 APK, 아이콘, `index.json`, `index.min.json`, `repo.json`을 갱신합니다.
-
-## 주의
-
-로그인, 결제, 성인 인증, 캡차, 차단 우회, DRM 우회 목적의 구현은 포함하지 않습니다.
-"""
-    (deploy_dir / "README.md").write_text(readme, encoding="utf-8")
-
-
-def write_index_html(deploy_dir: Path) -> None:
-    index_html = f"""<!doctype html>
-<html lang=\"ko\">
-<head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-  <title>Korean Mihon Extensions Repo</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; max-width: 760px; margin: 48px auto; padding: 0 20px; line-height: 1.6; }}
-    code {{ background: #f3f3f3; padding: 2px 6px; border-radius: 4px; }}
-  </style>
-</head>
-<body>
-  <h1>Korean Mihon Extensions Repo</h1>
-  <p>Mihon 저장소 URL:</p>
-  <p><code>https://raw.githubusercontent.com/{META['deploy_owner_repo']}/{META['deploy_branch']}/index.min.json</code></p>
-  <p>Source: <a href=\"{META['source']}\">Korean-Mihon-Extensions-Source</a></p>
-</body>
-</html>
-"""
-    (deploy_dir / "index.html").write_text(index_html, encoding="utf-8")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-dir", type=Path, default=Path.cwd())
@@ -404,8 +321,6 @@ def main() -> None:
     write_json(deploy_dir / "index.min.json", sorted_legacy, minify=True)
     write_json(deploy_dir / "index.json", modern_index)
     write_json(deploy_dir / "repo.json", repo_json)
-    write_readme(deploy_dir, sorted_legacy)
-    write_index_html(deploy_dir)
 
 
 if __name__ == "__main__":

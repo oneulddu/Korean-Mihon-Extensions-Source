@@ -120,7 +120,7 @@ jobs:
           cd deploy
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.md index.html index.json index.min.json repo.json apk icon
+          git add index.json index.min.json repo.json apk icon
           if git diff --cached --quiet; then
             echo "No deployment changes"
             exit 0

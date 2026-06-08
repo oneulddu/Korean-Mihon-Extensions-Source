@@ -1,0 +1,77 @@
+name: Lint
+
+on:
+  pull_request:
+    paths:
+      - '**/*.gradle'
+      - '**/*.gradle.kts'
+      - '**/*.kt'
+      - '**/*.java'
+      - '**/*.xml'
+      - 'gradle/**'
+      - 'src/**'
+      - 'core/**'
+      - 'common/**'
+      - 'lib/**'
+      - 'lib-multisrc/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/lint.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*.gradle'
+      - '**/*.gradle.kts'
+      - '**/*.kt'
+      - '**/*.java'
+      - '**/*.xml'
+      - 'gradle/**'
+      - 'src/**'
+      - 'core/**'
+      - 'common/**'
+      - 'lib/**'
+      - 'lib-multisrc/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/lint.yml'
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-scripts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Check Python scripts
+        run: |
+          python3 -m py_compile scripts/list_extensions.py scripts/update_repo.py tests/test_update_repo.py
+          python3 -m unittest tests.test_update_repo
+
+  spotless:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Run Spotless
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon spotlessCheck
