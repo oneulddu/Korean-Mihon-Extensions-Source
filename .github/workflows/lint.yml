@@ -52,7 +52,7 @@ jobs:
 
       - name: Check Python scripts
         run: |
-          python3 -m py_compile scripts/update_repo.py tests/test_update_repo.py
+          python3 -m py_compile scripts/list_extensions.py scripts/update_repo.py tests/test_update_repo.py
           python3 -m unittest tests.test_update_repo
 
   spotless:
