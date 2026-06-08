@@ -22,6 +22,7 @@ class PluginSpotless : Plugin<Project> {
         spotless {
             kotlin {
                 target("src/**/*.kt", "*.kts")
+                targetExclude("**/build/**")
                 ktlint(ktlintVersion)
                     .editorConfigOverride(
                         mapOf(
@@ -35,6 +36,7 @@ class PluginSpotless : Plugin<Project> {
 
             java {
                 target("src/**/*.java")
+                targetExclude("**/build/**")
                 googleJavaFormat()
                 removeUnusedImports()
                 trimTrailingWhitespace()
@@ -49,6 +51,7 @@ class PluginSpotless : Plugin<Project> {
 
             format("xml") {
                 target("src/**/*.xml")
+                targetExclude("**/build/**")
                 trimTrailingWhitespace()
                 endWithNewline()
             }

@@ -11,6 +11,7 @@ val editorConfigFile = rootProject.file("../../.editorconfig")
 spotless {
     kotlin {
         target("src/**/*.kt", "*.kts")
+        targetExclude("**/build/**")
         ktlint(ktlintVersion)
             .setEditorConfigPath(editorConfigFile)
             .editorConfigOverride(
