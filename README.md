@@ -1,85 +1,130 @@
-# Korean Mihon Extensions Source
+<div align="center">
 
-한국어 Mihon/Tachiyomi 확장을 모아 수정하기 위한 소스 레포입니다.
+# 🛠️ Korean Mihon Extensions — Source
 
-배포 전용 레포는 아래에 따로 둡니다.
+**한국어 만화·웹툰 [Mihon](https://mihon.app) / Tachiyomi 확장의 소스 코드 & 빌드 환경**
+
+[![Distribution](https://img.shields.io/badge/배포_레포-Korean--Mihon--Extensions-2979FF?style=for-the-badge&logo=github&logoColor=white)](https://github.com/oneulddu/Korean-Mihon-Extensions)
+[![Build](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/workflows/build_extensions_release.yml)
+![Language](https://img.shields.io/badge/Language-한국어-success?style=for-the-badge)
+
+</div>
+
+---
+
+## ✨ 소개
+
+이 저장소는 한국어 만화·웹툰 사이트용 Mihon / Tachiyomi 확장의 **소스 코드와 Gradle 빌드 환경**을 관리합니다.
+빌드된 APK·인덱스는 별도의 **배포 전용 저장소**로 자동 배포됩니다.
 
 ```text
-https://github.com/oneulddu/Korean-Mihon-Extensions
+배포 레포 → https://github.com/oneulddu/Korean-Mihon-Extensions
+Mihon URL → https://raw.githubusercontent.com/oneulddu/Korean-Mihon-Extensions/repo/index.min.json
 ```
 
+---
 
-## 포함한 한국어 확장
+## 📦 포함 확장
 
 Keiyoushi `extensions-source` PR #15649 기준 한국어 확장들을 함께 가져왔습니다.
+소스에는 9개 확장이 있으며, 이 중 배포 레포에 올라가는 확장은 ✅로 표시했습니다.
 
-```text
-blacktoon
-manatoki
-navercomic
-ntk
-rawdex
-toon11
-toonkor
-wolfdotcom
-xtoon
-```
+| 확장 | 디렉터리 (`src/ko/…`) | 배포 |
+| :--- | :--- | :--: |
+| 11toon | `toon11` | ✅ |
+| BlackToon | `blacktoon` | ✅ |
+| Manatoki | `manatoki` | ✅ |
+| Naver Comic | `navercomic` | ✅ |
+| NTK | `ntk` | ✅ |
+| Toonkor | `toonkor` | ✅ |
+| Wolf.com | `wolfdotcom` | ✅ |
+| Xtoon | `xtoon` | ✅ |
+| RawDex | `rawdex` | — |
 
-`newtoki` 이름으로 남아 있는 최종 디렉터리는 없고, 해당 PR 최종 상태에서는 `ntk` 패키지로 정리되어 있습니다.
+> `newtoki` 이름으로 남아 있는 최종 디렉터리는 없고, 해당 PR 최종 상태에서는 `ntk` 패키지로 정리되어 있습니다.
 
+---
 
-## 자동 빌드/배포
+## 🏗️ 빌드
 
-`.github/workflows/build_extensions_release.yml`가 한국어 확장들을 빌드하고 `oneulddu/Korean-Mihon-Extensions`의 `repo` 브랜치에 APK와 인덱스를 갱신합니다.
-
-필요한 GitHub Secrets:
-
-```text
-SIGNING_KEYSTORE_BASE64  # signingkey.jks를 base64 인코딩한 값
-KEY_STORE_PASSWORD
-ALIAS
-KEY_PASSWORD
-DEPLOY_TOKEN             # 배포 레포 contents write 권한이 있는 토큰
-```
-
-서명키와 토큰은 민감 정보라 레포에는 넣지 않습니다.
-
-## 빌드
-
-Java와 Android SDK가 필요합니다.
+Java(JDK 21)와 Android SDK가 필요합니다.
 
 ```bash
 export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
 export PATH="$JAVA_HOME/bin:$PATH"
 export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
+
+# 특정 확장만 빌드
 ./gradlew $(python3 scripts/list_extensions.py --gradle-tasks --extensions "xtoon ntk")
 ```
 
-## 서명
+---
 
-릴리즈 APK를 같은 패키지명으로 계속 업데이트하려면 같은 release 키가 필요합니다.
+## 🤖 자동 빌드 & 배포
 
-`signingkey.jks`와 `signing.env`는 Git에 올리지 않습니다.
+[`.github/workflows/build_extensions_release.yml`](.github/workflows/build_extensions_release.yml)가
+한국어 확장을 빌드한 뒤, [`oneulddu/Korean-Mihon-Extensions`](https://github.com/oneulddu/Korean-Mihon-Extensions)의
+`repo` 브랜치에 APK·아이콘·인덱스를 자동 갱신합니다.
 
-현재 배포 APK 서명 키 지문:
+**필요한 GitHub Secrets**
 
-```text
-SHA-256: b25af02d178fad20ebe739e59336f2ae5e307dcd1375418278e752dba03497cb
-```
+| Secret | 설명 |
+| :--- | :--- |
+| `SIGNING_KEYSTORE_BASE64` | `signingkey.jks`를 base64 인코딩한 값 |
+| `KEY_STORE_PASSWORD` | 키스토어 비밀번호 |
+| `ALIAS` | 키 별칭 |
+| `KEY_PASSWORD` | 키 비밀번호 |
+| `DEPLOY_TOKEN` | 배포 레포 contents write 권한 토큰 |
 
-## 자동 배포 스크립트 구조
+> 서명키와 토큰은 민감 정보라 레포에는 포함하지 않습니다.
 
-- `scripts/list_extensions.py`: 빌드할 확장 모듈을 찾고 Gradle task 목록을 만듭니다.
-- `scripts/update_repo.py`: 빌드된 APK들을 `index.json`, `index.min.json`, `repo.json`에 반영합니다.
-- `scripts/extensions.json`: 자동 추론이 어려운 멀티 소스 확장의 source 이름, 기본 URL, versionId를 관리합니다.
+---
 
-예시:
+## 🧩 배포 스크립트 구조
+
+| 스크립트 | 역할 |
+| :--- | :--- |
+| `scripts/list_extensions.py` | 빌드할 확장 모듈을 찾아 Gradle task 목록 생성 |
+| `scripts/update_repo.py` | 빌드된 APK를 `index.json`·`index.min.json`·`repo.json`에 반영 |
+| `scripts/extensions.json` | 자동 추론이 어려운 멀티 소스 확장의 source 이름·기본 URL·versionId 관리 |
+
+**예시**
 
 ```bash
 python3 scripts/list_extensions.py --gradle-tasks --extensions "xtoon ntk"
 python3 scripts/update_repo.py --deploy-dir ../Korean-Mihon-Extensions --extensions "xtoon ntk"
 ```
 
-## 주의
+---
 
-로그인, 결제, 성인 인증, 캡차, 차단 우회, DRM 우회는 구현하지 않습니다. 공개 HTML에서 바로 확인 가능한 정보만 파싱합니다.
+## 🔐 서명
+
+릴리즈 APK를 같은 패키지명으로 계속 업데이트하려면 동일한 release 키가 필요합니다.
+
+```text
+SHA-256: b25af02d178fad20ebe739e59336f2ae5e307dcd1375418278e752dba03497cb
+```
+
+> `signingkey.jks`와 `signing.env`는 Git에 포함하지 않고 별도로 안전하게 보관합니다.
+
+---
+
+## ⚠️ 주의
+
+- 로그인, 결제, 성인 인증, 캡차, 차단 우회, DRM 우회는 **구현하지 않습니다.**
+- 공개된 HTML에서 바로 확인 가능한 정보만 파싱합니다.
+- 콘텐츠 저작권은 각 원저작자 및 해당 사이트에 있으며, 이용에 대한 책임은 사용자 본인에게 있습니다.
+
+---
+
+## 📄 라이선스
+
+이 저장소는 [Apache License 2.0](LICENSE)을 따릅니다.
+
+<div align="center">
+
+---
+
+Made with ❤️ for the Korean Mihon community
+
+</div>
