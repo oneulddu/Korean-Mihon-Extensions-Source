@@ -2,7 +2,7 @@
   "extensions": {
     "blacktoon": {
       "sources": [
-        { "name": "블랙툰", "lang": "ko", "baseUrl": "https://blacktoon.me" }
+        { "name": "블랙툰", "lang": "ko", "baseUrl": "https://blacktoon413.com" }
       ]
     },
     "manatoki": {

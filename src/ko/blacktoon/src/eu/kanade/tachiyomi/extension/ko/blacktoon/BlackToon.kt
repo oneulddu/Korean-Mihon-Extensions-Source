@@ -1,6 +1,10 @@
 package eu.kanade.tachiyomi.extension.ko.blacktoon
 
+import android.content.SharedPreferences
+import androidx.preference.EditTextPreference
+import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -8,6 +12,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
@@ -19,14 +24,19 @@ import rx.Observable
 import uy.kohesive.injekt.injectLazy
 import kotlin.random.Random
 
-class BlackToon : HttpSource() {
+class BlackToon :
+    HttpSource(),
+    ConfigurableSource {
 
     override val name = "블랙툰"
 
     override val lang = "ko"
 
+    private val preferences: SharedPreferences by getPreferencesLazy()
+
     private var currentBaseUrlHost = ""
-    override val baseUrl = "https://blacktoon.me"
+    override val baseUrl: String
+        get() = "https://blacktoon$domainNumber.com"
 
     private val cdnUrl = "https://webimg7.com/"
 
@@ -37,17 +47,21 @@ class BlackToon : HttpSource() {
         .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 
     override val client = network.client.newBuilder().addInterceptor { chain ->
+        val originalRequest = chain.request()
+        val configuredBaseUrlHost = baseUrl.toHttpUrlOrNull()?.host
+
         if (currentBaseUrlHost.isBlank()) {
             noRedirectClient.newCall(GET(baseUrl, headers)).execute().use {
                 currentBaseUrlHost = it.headers["location"]?.toHttpUrlOrNull()?.host
-                    ?: throw IOException("unable to get updated url")
+                    ?: it.request.url.host
+                updateDomainNumberFromHost(currentBaseUrlHost)
             }
         }
 
-        val request = chain.request().newBuilder().apply {
-            if (chain.request().url.toString().startsWith(baseUrl)) {
+        val request = originalRequest.newBuilder().apply {
+            if (originalRequest.url.host == configuredBaseUrlHost) {
                 url(
-                    chain.request().url.newBuilder()
+                    originalRequest.url.newBuilder()
                         .host(currentBaseUrlHost)
                         .build(),
                 )
@@ -201,6 +215,53 @@ class BlackToon : HttpSource() {
         else -> cdnUrl + this
     }
 
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        EditTextPreference(screen.context).apply {
+            key = PREF_DOMAIN_NUMBER
+            title = "도메인 번호 (blacktoon#.com)"
+            summary = "현재 도메인 번호: $domainNumber\n숫자만 입력하세요 (예: 413)"
+            setDefaultValue(DEFAULT_DOMAIN_NUMBER)
+            setOnPreferenceChangeListener { _, newValue ->
+                val value = (newValue as String).trim()
+                if (value.isEmpty() || value.toIntOrNull() == null) {
+                    false
+                } else {
+                    domainNumber = value
+                    false
+                }
+            }
+        }.also(screen::addPreference)
+    }
+
+    private var domainNumber = ""
+        get() {
+            val currentValue = field
+            if (currentValue.isNotEmpty()) return currentValue
+
+            val stored = preferences.getString(PREF_DOMAIN_NUMBER, DEFAULT_DOMAIN_NUMBER)!!
+            val normalized = normalizeDomainNumber(stored)
+            if (normalized != stored) {
+                preferences.edit().putString(PREF_DOMAIN_NUMBER, normalized).apply()
+            }
+
+            field = normalized
+            return normalized
+        }
+        set(value) {
+            val normalized = normalizeDomainNumber(value)
+            preferences.edit().putString(PREF_DOMAIN_NUMBER, normalized).apply()
+            field = normalized
+        }
+
+    private fun normalizeDomainNumber(value: String): String = value.trim().trimStart('0').ifEmpty { DEFAULT_DOMAIN_NUMBER }
+
+    private fun updateDomainNumberFromHost(host: String) {
+        val newDomainNumber = domainRegex.matchEntire(host)?.groupValues?.get(1) ?: return
+        if (newDomainNumber != domainNumber) {
+            domainNumber = newDomainNumber
+        }
+    }
+
     // unused
     override fun popularMangaRequest(page: Int): Request = throw UnsupportedOperationException()
     override fun popularMangaParse(response: Response): MangasPage = throw UnsupportedOperationException()
@@ -213,6 +274,9 @@ class BlackToon : HttpSource() {
     companion object {
         private const val USER_AGENT =
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        private const val PREF_DOMAIN_NUMBER = "domain_number"
+        private const val DEFAULT_DOMAIN_NUMBER = "413"
         private val dataScriptRegex = Regex("""loadScript\((?:inc_url\+)?['"](/data/webtoon/webtoon_\d+_\d+\.js)""")
+        private val domainRegex = Regex("""blacktoon(\d+)\.com""")
     }
 }
