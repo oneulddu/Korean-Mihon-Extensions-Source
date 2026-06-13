@@ -226,7 +226,7 @@ class BlackToon :
                 if (value.isEmpty() || value.toIntOrNull() == null) {
                     false
                 } else {
-                    domainNumber = value
+                    saveDomainNumber(value, resetCachedHost = true)
                     false
                 }
             }
@@ -247,18 +247,23 @@ class BlackToon :
             field = normalized
             return normalized
         }
-        set(value) {
-            val normalized = normalizeDomainNumber(value)
-            preferences.edit().putString(PREF_DOMAIN_NUMBER, normalized).apply()
-            field = normalized
-        }
+        private set
 
     private fun normalizeDomainNumber(value: String): String = value.trim().trimStart('0').ifEmpty { DEFAULT_DOMAIN_NUMBER }
+
+    private fun saveDomainNumber(value: String, resetCachedHost: Boolean) {
+        val normalized = normalizeDomainNumber(value)
+        preferences.edit().putString(PREF_DOMAIN_NUMBER, normalized).apply()
+        domainNumber = normalized
+        if (resetCachedHost) {
+            currentBaseUrlHost = ""
+        }
+    }
 
     private fun updateDomainNumberFromHost(host: String) {
         val newDomainNumber = domainRegex.matchEntire(host)?.groupValues?.get(1) ?: return
         if (newDomainNumber != domainNumber) {
-            domainNumber = newDomainNumber
+            saveDomainNumber(newDomainNumber, resetCachedHost = false)
         }
     }
 
