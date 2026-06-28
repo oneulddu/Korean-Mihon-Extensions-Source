@@ -30,7 +30,7 @@ class Jjaptoon :
 
     override val name = "짭툰"
 
-    private val defaultBaseUrl = "https://jjaptoon003.com"
+    private val defaultBaseUrl = "https://jjabtoon003.com"
 
     private val baseUrlPref = "overrideBaseUrl_v${AppInfo.getVersionName()}"
 
