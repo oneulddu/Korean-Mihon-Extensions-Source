@@ -86,6 +86,25 @@ class Jjaptoon :
     override fun latestUpdatesParse(response: Response): MangasPage = mangaPageParse(response)
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
+        if (filters.selectedSort == SORT_POPULAR) {
+            if (query.isNotBlank()) {
+                throw UnsupportedOperationException("인기순은 검색어와 함께 사용할 수 없습니다.")
+            }
+            if (filters.selectedStatus != FILTER_ALL) {
+                throw UnsupportedOperationException("인기순은 상태 필터와 함께 사용할 수 없습니다.")
+            }
+
+            return Observable.fromCallable {
+                livewireMangaPage(
+                    initialUrl = homeUrl(),
+                    referer = "$baseUrl/",
+                    updates = filters.livewireUpdates() + ("selectedSort" to SORT_POPULAR),
+                    page = page,
+                    paginator = HOME_PAGINATOR,
+                )
+            }
+        }
+
         val updates = filters.livewireUpdates()
         if (updates.isEmpty()) {
             return client.newCall(searchMangaRequest(page, query, filters))
@@ -109,6 +128,7 @@ class Jjaptoon :
     override fun searchMangaParse(response: Response): MangasPage = mangaPageParse(response)
 
     override fun getFilterList(): FilterList = FilterList(
+        SortFilter(),
         TypeFilter(),
         StatusFilter(),
         ScheduleFilter(),
@@ -220,6 +240,12 @@ class Jjaptoon :
         }
         .toMap()
 
+    private val FilterList.selectedSort: String
+        get() = filterIsInstance<SortFilter>().firstOrNull()?.selectedValue ?: SORT_LATEST
+
+    private val FilterList.selectedStatus: String
+        get() = filterIsInstance<StatusFilter>().firstOrNull()?.selectedValue ?: FILTER_ALL
+
     private fun mangaPageParse(response: Response): MangasPage = mangaPageParse(response.asJsoup())
 
     private fun mangaPageParse(document: Document): MangasPage {
@@ -243,6 +269,18 @@ class Jjaptoon :
     ) {
         val selectedValue: String
             get() = options[state].second
+    }
+
+    private class SortFilter :
+        Filter.Select<String>(
+            "정렬",
+            arrayOf("최신순", "인기순"),
+        ) {
+        val selectedValue: String
+            get() = when (state) {
+                1 -> SORT_POPULAR
+                else -> SORT_LATEST
+            }
     }
 
     private class TypeFilter :
@@ -501,6 +539,8 @@ class Jjaptoon :
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
         private const val BASE_URL_PREF_SUMMARY = "Override default domain with a different one"
         private const val FILTER_ALL = "all"
+        private const val SORT_LATEST = "latest"
+        private const val SORT_POPULAR = "popular"
         private const val HOME_PAGINATOR = "comicsPage"
         private const val COMICS_PAGINATOR = "page"
 
