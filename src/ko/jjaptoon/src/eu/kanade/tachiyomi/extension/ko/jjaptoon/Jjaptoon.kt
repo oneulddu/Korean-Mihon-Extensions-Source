@@ -38,7 +38,7 @@ class Jjaptoon :
 
     override val lang = "ko"
 
-    override val supportsLatest = true
+    override val supportsLatest = false
 
     override val client = network.cloudflareClient
 
@@ -52,9 +52,9 @@ class Jjaptoon :
 
     override fun popularMangaParse(response: Response): MangasPage = mangaPageParse(response)
 
-    override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
+    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
 
-    override fun latestUpdatesParse(response: Response): MangasPage = mangaPageParse(response)
+    override fun latestUpdatesParse(response: Response): MangasPage = throw UnsupportedOperationException()
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val url = "$baseUrl/comics".toHttpUrl().newBuilder().apply {
