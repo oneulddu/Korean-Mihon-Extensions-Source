@@ -447,6 +447,8 @@ class Jjaptoon :
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        getPrefBaseUrl()
+
         EditTextPreference(screen.context).apply {
             key = baseUrlPref
             title = BASE_URL_PREF_TITLE
@@ -457,7 +459,22 @@ class Jjaptoon :
         }.also(screen::addPreference)
     }
 
-    private fun getPrefBaseUrl(): String = preferences.getString(baseUrlPref, defaultBaseUrl)!!
+    private fun getPrefBaseUrl(): String {
+        val savedBaseUrl = preferences.getString(baseUrlPref, null)?.trimEnd('/')
+        if (savedBaseUrl.isNullOrBlank()) {
+            return defaultBaseUrl
+        }
+
+        if (savedBaseUrl == OLD_DEFAULT_BASE_URL) {
+            preferences.edit()
+                .putString(baseUrlPref, defaultBaseUrl)
+                .apply()
+
+            return defaultBaseUrl
+        }
+
+        return savedBaseUrl
+    }
 
     private fun parseStatus(text: String): Int = when {
         "완결" in text -> SManga.COMPLETED
@@ -474,6 +491,7 @@ class Jjaptoon :
     companion object {
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
         private const val BASE_URL_PREF_SUMMARY = "Override default domain with a different one"
+        private const val OLD_DEFAULT_BASE_URL = "https://jjaptoon003.com"
         private const val FILTER_ALL = "all"
         private const val HOME_PAGINATOR = "comicsPage"
         private const val COMICS_PAGINATOR = "page"
