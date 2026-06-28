@@ -45,7 +45,7 @@ class Jjaptoon :
 
     override val name = "짭툰"
 
-    private val defaultBaseUrl = "https://jjabtoon003.com"
+    private val defaultBaseUrl = "https://www.jjabtoon003.com"
 
     private val baseUrlPref = "overrideBaseUrl_v${AppInfo.getVersionName()}"
 
@@ -141,6 +141,14 @@ class Jjaptoon :
         val initialResponse = client.newCall(GET(initialUrl, headersBuilder().set("Referer", referer).build())).execute()
         initialResponse.use {
             val document = it.asJsoup()
+            val livewireBaseUrl = it.request.url.newBuilder()
+                .encodedPath("/")
+                .query(null)
+                .fragment(null)
+                .build()
+                .toString()
+                .trimEnd('/')
+            val livewireReferer = it.request.url.toString()
             val token = document.selectFirst("script[data-csrf]")?.attr("data-csrf")
                 ?: throw IllegalStateException("Unable to find Livewire CSRF token")
             val snapshot = document.getElementsByAttribute("wire:snapshot").first()?.attr("wire:snapshot")?.unescapeHtml()
@@ -159,7 +167,8 @@ class Jjaptoon :
 
             val livewireResponse = client.newCall(
                 livewireRequest(
-                    referer = referer,
+                    livewireBaseUrl = livewireBaseUrl,
+                    referer = livewireReferer,
                     body = LivewireRequest(
                         token = token,
                         components = listOf(
@@ -186,18 +195,18 @@ class Jjaptoon :
         }
     }
 
-    private fun livewireRequest(referer: String, body: LivewireRequest): Request {
+    private fun livewireRequest(livewireBaseUrl: String, referer: String, body: LivewireRequest): Request {
         val requestBody = json.encodeToString(body).toRequestBody(JSON_MEDIA_TYPE)
         val requestHeaders = headersBuilder()
             .set("Accept", "*/*")
             .set("Content-Type", JSON_MEDIA_TYPE.toString())
-            .set("Origin", baseUrl)
+            .set("Origin", livewireBaseUrl)
             .set("Referer", referer)
             .set("X-Livewire", "")
             .build()
 
         return Request.Builder()
-            .url("$baseUrl/livewire/update")
+            .url("$livewireBaseUrl/livewire/update")
             .headers(requestHeaders)
             .post(requestBody)
             .build()
@@ -465,7 +474,7 @@ class Jjaptoon :
             return defaultBaseUrl
         }
 
-        if (savedBaseUrl == OLD_DEFAULT_BASE_URL) {
+        if (savedBaseUrl in OLD_DEFAULT_BASE_URLS) {
             preferences.edit()
                 .putString(baseUrlPref, defaultBaseUrl)
                 .apply()
@@ -491,10 +500,14 @@ class Jjaptoon :
     companion object {
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
         private const val BASE_URL_PREF_SUMMARY = "Override default domain with a different one"
-        private const val OLD_DEFAULT_BASE_URL = "https://jjaptoon003.com"
         private const val FILTER_ALL = "all"
         private const val HOME_PAGINATOR = "comicsPage"
         private const val COMICS_PAGINATOR = "page"
+
+        private val OLD_DEFAULT_BASE_URLS = setOf(
+            "https://jjaptoon003.com",
+            "https://jjabtoon003.com",
+        )
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
