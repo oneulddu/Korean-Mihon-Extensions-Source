@@ -8,9 +8,14 @@ import hashlib
 import json
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from readme_utils import pretty_host, short_package, update_readme
 
 META = {
     "repo_name": "Korean Mihon Extensions",
@@ -258,6 +263,23 @@ def read_existing_modern(deploy_dir: Path) -> dict[str, dict[str, Any]]:
     return {entry["packageName"]: entry for entry in entries if isinstance(entry, dict) and "packageName" in entry}
 
 
+def build_deploy_readme_table(modern_index: dict[str, Any]) -> str:
+    lines = [
+        "| 확장 | 버전 | 사이트 | 패키지 |",
+        "| :--- | :--: | :--- | :--- |",
+    ]
+    for entry in modern_index.get("extensions", []):
+        name = entry.get("name", "")
+        version = entry.get("versionName", "")
+        sources = entry.get("sources", [])
+        home = sources[0].get("homeUrl", "") if sources else ""
+        host = pretty_host(home) if home else ""
+        site = f"[{host}]({home})" if home else ""
+        package = short_package(entry.get("packageName", ""))
+        lines.append(f"| {name} | `{version}` | {site} | `{package}` |")
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-dir", type=Path, default=Path.cwd())
@@ -321,6 +343,10 @@ def main() -> None:
     write_json(deploy_dir / "index.min.json", sorted_legacy, minify=True)
     write_json(deploy_dir / "index.json", modern_index)
     write_json(deploy_dir / "repo.json", repo_json)
+
+    readme_body = build_deploy_readme_table(modern_index)
+    if update_readme(deploy_dir / "README.md", readme_body):
+        print(f"Updated {deploy_dir / 'README.md'}")
 
 
 if __name__ == "__main__":

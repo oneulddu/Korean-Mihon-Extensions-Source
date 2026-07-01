@@ -27,19 +27,23 @@ Mihon URL → https://raw.githubusercontent.com/oneulddu/Korean-Mihon-Extensions
 ## 📦 포함 확장
 
 Keiyoushi `extensions-source` PR #15649 기준 한국어 확장들을 함께 가져왔습니다.
-소스의 9개 확장 모두 배포 레포(`repo` 브랜치)로 배포됩니다.
+소스의 <!-- extensions:count -->10<!-- /extensions:count -->개 확장 모두 배포 레포(`repo` 브랜치)로 배포됩니다.
 
-| 확장 | 디렉터리 (`src/ko/…`) | 배포 |
+<!-- 아래 표는 scripts/update_source_readme.py가 자동으로 갱신합니다. 직접 수정하지 마세요. -->
+<!-- extensions:start -->
+| 확장 | 디렉터리 (`src/…`) | 배포 |
 | :--- | :--- | :--: |
-| 11toon | `toon11` | ✅ |
-| BlackToon | `blacktoon` | ✅ |
-| Manatoki | `manatoki` | ✅ |
-| Naver Comic | `navercomic` | ✅ |
-| NTK | `ntk` | ✅ |
-| RawDEX | `rawdex` | ✅ |
-| Toonkor | `toonkor` | ✅ |
-| Wolf.com | `wolfdotcom` | ✅ |
-| Xtoon | `xtoon` | ✅ |
+| 11toon | `ko/toon11` | ✅ |
+| BlackToon | `ko/blacktoon` | ✅ |
+| Jjaptoon | `ko/jjaptoon` | ✅ |
+| Manatoki | `ko/manatoki` | ✅ |
+| Naver Comic | `ko/navercomic` | ✅ |
+| NTK | `ko/ntk` | ✅ |
+| RawDEX | `ko/rawdex` | ✅ |
+| Toonkor | `ko/toonkor` | ✅ |
+| Wolf.com | `ko/wolfdotcom` | ✅ |
+| Xtoon | `ko/xtoon` | ✅ |
+<!-- extensions:end -->
 
 > `newtoki` 이름으로 남아 있는 최종 디렉터리는 없고, 해당 PR 최종 상태에서는 `ntk` 패키지로 정리되어 있습니다.
 
@@ -64,7 +68,8 @@ export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 
 [`.github/workflows/build_extensions_release.yml`](.github/workflows/build_extensions_release.yml)가
 한국어 확장을 빌드한 뒤, [`oneulddu/Korean-Mihon-Extensions`](https://github.com/oneulddu/Korean-Mihon-Extensions)의
-`repo` 브랜치에 APK·아이콘·인덱스를 자동 갱신합니다.
+`repo` 브랜치에 APK·아이콘·인덱스와 배포 레포 README 표를 자동 갱신하고,
+이 레포의 확장 표(`README.md`)도 함께 최신 상태로 맞춥니다.
 
 **필요한 GitHub Secrets**
 
@@ -85,7 +90,8 @@ export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 | 스크립트 | 역할 |
 | :--- | :--- |
 | `scripts/list_extensions.py` | 빌드할 확장 모듈을 찾아 Gradle task 목록 생성 |
-| `scripts/update_repo.py` | 빌드된 APK를 `index.json`·`index.min.json`·`repo.json`에 반영 |
+| `scripts/update_repo.py` | 빌드된 APK를 `index.json`·`index.min.json`·`repo.json`에 반영하고 배포 레포 `README.md` 확장 표까지 자동 갱신 |
+| `scripts/update_source_readme.py` | 이 레포 `README.md`의 확장 표를 소스 기준으로 자동 갱신 |
 | `scripts/extensions.json` | 자동 추론이 어려운 멀티 소스 확장의 source 이름·기본 URL·versionId 관리 |
 
 **예시**
