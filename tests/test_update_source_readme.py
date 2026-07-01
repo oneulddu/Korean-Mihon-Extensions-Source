@@ -34,7 +34,7 @@ class UpdateSourceReadmeTest(unittest.TestCase):
 
             readme = (
                 "# Source\n\n"
-                "보존될 소개 문단.\n\n"
+                "보존될 소개 문단. 총 <!-- extensions:count -->9<!-- /extensions:count -->개.\n\n"
                 "<!-- extensions:start -->\n"
                 "| stale |\n"
                 "<!-- extensions:end -->\n\n"
@@ -60,6 +60,9 @@ class UpdateSourceReadmeTest(unittest.TestCase):
             self.assertNotIn("| stale |", updated)
             self.assertIn("| Alpha | `ko/alpha` | ✅ |", updated)
             self.assertIn("| Beta | `ko/beta` | ✅ |", updated)
+            # 개수 마커도 실제 확장 수(2개)로 갱신되어야 한다.
+            self.assertIn("<!-- extensions:count -->2<!-- /extensions:count -->", updated)
+            self.assertNotIn(">9<", updated)
 
             # 이미 최신이면 --check 는 0을 반환한다.
             result = subprocess.run(

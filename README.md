@@ -27,7 +27,7 @@ Mihon URL → https://raw.githubusercontent.com/oneulddu/Korean-Mihon-Extensions
 ## 📦 포함 확장
 
 Keiyoushi `extensions-source` PR #15649 기준 한국어 확장들을 함께 가져왔습니다.
-소스의 9개 확장 모두 배포 레포(`repo` 브랜치)로 배포됩니다.
+소스의 <!-- extensions:count -->10<!-- /extensions:count -->개 확장 모두 배포 레포(`repo` 브랜치)로 배포됩니다.
 
 <!-- 아래 표는 scripts/update_source_readme.py가 자동으로 갱신합니다. 직접 수정하지 마세요. -->
 <!-- extensions:start -->

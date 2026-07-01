@@ -19,6 +19,28 @@ _BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+COUNT_MARKER_START = "<!-- extensions:count -->"
+COUNT_MARKER_END = "<!-- /extensions:count -->"
+
+_COUNT_RE = re.compile(
+    re.escape(COUNT_MARKER_START) + r".*?" + re.escape(COUNT_MARKER_END),
+    re.DOTALL,
+)
+
+
+def wrap_count(count: int) -> str:
+    """Wrap an extension count with the inline count markers."""
+
+    return f"{COUNT_MARKER_START}{count}{COUNT_MARKER_END}"
+
+
+def replace_count(text: str, count: int) -> str:
+    """Replace the inline extension count in *text* when the markers exist."""
+
+    if _COUNT_RE.search(text):
+        return _COUNT_RE.sub(lambda _: wrap_count(count), text, count=1)
+    return text
+
 
 def wrap_block(body: str) -> str:
     """Wrap a rendered table body with the managed markers."""
