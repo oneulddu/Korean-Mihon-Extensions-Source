@@ -40,38 +40,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Sync source README extension table
-        if: github.event_name == 'push'
-        # 문서 동기화 실패가 뒤따르는 빌드/배포를 절대 막지 않도록 격리한다.
-        continue-on-error: true
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 빌드 워킹트리를 오염시키지 않도록 README 커밋/푸시는 별도 워크트리에서 처리한다.
-          # main이 그사이 진행돼 non-fast-forward가 나도 refetch 후 재시도로 흡수하고,
-          # 끝내 실패하면 경고만 남긴다(다음 push 실행에서 다시 동기화됨).
-          SYNC_DIR="$(mktemp -d)"
-          git worktree add --detach "$SYNC_DIR" "origin/${GITHUB_REF_NAME}"
-          for attempt in 1 2 3; do
-            git -C "$SYNC_DIR" fetch origin "${GITHUB_REF_NAME}"
-            git -C "$SYNC_DIR" reset --hard "origin/${GITHUB_REF_NAME}"
-            python3 scripts/update_source_readme.py \
-              --source-dir "$GITHUB_WORKSPACE" \
-              --readme "$SYNC_DIR/README.md"
-            if git -C "$SYNC_DIR" diff --quiet -- README.md; then
-              echo "Source README already up to date on remote"
-              break
-            fi
-            git -C "$SYNC_DIR" add README.md
-            git -C "$SYNC_DIR" commit -m "docs: 확장 목록 표 자동 갱신"
-            if git -C "$SYNC_DIR" push origin "HEAD:${GITHUB_REF_NAME}"; then
-              echo "Pushed source README update (attempt ${attempt})"
-              break
-            fi
-            echo "::warning::Push rejected (attempt ${attempt}); refetching and retrying"
-          done
-          git worktree remove --force "$SYNC_DIR" || true
-
       - name: Resolve extension build tasks
         id: tasks
         run: |
@@ -176,3 +144,38 @@ jobs:
             -m "Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}" \
             -m "Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git push origin repo
+
+      - name: Sync source README extension table
+        # 빌드/배포가 성공한 뒤에만 실행한다. push 이벤트에서 실제로 빌드가 돌아
+        # 배포가 갱신된 경우에만 소스 README의 배포 상태 표를 게시한다.
+        # (빌드 실패 시 이 스텝은 건너뛰므로 README가 미배포 확장을 배포됨으로 표기하지 않는다.)
+        if: github.event_name == 'push' && steps.tasks.outputs.should_build == 'true'
+        # 문서 동기화 실패가 이미 끝난 릴리스를 실패로 만들지 않도록 격리한다.
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 빌드 워킹트리를 오염시키지 않도록 README 커밋/푸시는 별도 워크트리에서 처리한다.
+          # main이 그사이 진행돼 non-fast-forward가 나도 refetch 후 재시도로 흡수하고,
+          # 끝내 실패하면 경고만 남긴다(다음 push 실행에서 다시 동기화됨).
+          SYNC_DIR="$(mktemp -d)"
+          git worktree add --detach "$SYNC_DIR" "origin/${GITHUB_REF_NAME}"
+          for attempt in 1 2 3; do
+            git -C "$SYNC_DIR" fetch origin "${GITHUB_REF_NAME}"
+            git -C "$SYNC_DIR" reset --hard "origin/${GITHUB_REF_NAME}"
+            python3 scripts/update_source_readme.py \
+              --source-dir "$GITHUB_WORKSPACE" \
+              --readme "$SYNC_DIR/README.md"
+            if git -C "$SYNC_DIR" diff --quiet -- README.md; then
+              echo "Source README already up to date on remote"
+              break
+            fi
+            git -C "$SYNC_DIR" add README.md
+            git -C "$SYNC_DIR" commit -m "docs: 확장 목록 표 자동 갱신"
+            if git -C "$SYNC_DIR" push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Pushed source README update (attempt ${attempt})"
+              break
+            fi
+            echo "::warning::Push rejected (attempt ${attempt}); refetching and retrying"
+          done
+          git worktree remove --force "$SYNC_DIR" || true
