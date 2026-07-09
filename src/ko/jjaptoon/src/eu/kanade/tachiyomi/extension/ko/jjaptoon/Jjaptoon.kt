@@ -104,18 +104,17 @@ class Jjaptoon :
         page: Int = 1,
         query: String = "",
         parameters: Map<String, String> = emptyMap(),
-    ): String =
-        "$baseUrl/comics".toHttpUrl().newBuilder().apply {
-            if (query.isNotBlank()) {
-                addQueryParameter("search", query.trim())
-            }
-            parameters.forEach { (key, value) ->
-                addQueryParameter(key, value)
-            }
-            if (page > 1) {
-                addQueryParameter("page", page.toString())
-            }
-        }.build().toString()
+    ): String = "$baseUrl/comics".toHttpUrl().newBuilder().apply {
+        if (query.isNotBlank()) {
+            addQueryParameter("search", query.trim())
+        }
+        parameters.forEach { (key, value) ->
+            addQueryParameter(key, value)
+        }
+        if (page > 1) {
+            addQueryParameter("page", page.toString())
+        }
+    }.build().toString()
 
     private fun homeUrl(
         page: Int = 1,
