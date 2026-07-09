@@ -219,7 +219,7 @@ class BlackToon :
         EditTextPreference(screen.context).apply {
             key = PREF_DOMAIN_NUMBER
             title = "도메인 번호 (blacktoon#.com)"
-            summary = "현재 도메인 번호: $domainNumber\n숫자만 입력하세요 (예: 414)"
+            summary = "현재 도메인 번호: $domainNumber\n숫자만 입력하세요 (예: 415)"
             setDefaultValue(DEFAULT_DOMAIN_NUMBER)
             setOnPreferenceChangeListener { _, newValue ->
                 val value = (newValue as String).trim()
@@ -280,7 +280,7 @@ class BlackToon :
         private const val USER_AGENT =
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
         private const val PREF_DOMAIN_NUMBER = "domain_number"
-        private const val DEFAULT_DOMAIN_NUMBER = "414"
+        private const val DEFAULT_DOMAIN_NUMBER = "415"
         private val dataScriptRegex = Regex("""loadScript\((?:inc_url\+)?['"](/data/webtoon/webtoon_\d+_\d+\.js)""")
         private val domainRegex = Regex("""blacktoon(\d+)\.com""")
     }
