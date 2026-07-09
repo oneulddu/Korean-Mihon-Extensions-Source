@@ -17,23 +17,12 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.tryParse
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import org.jsoup.parser.Parser
 import rx.Observable
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -59,27 +48,16 @@ class Jjaptoon :
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
-    private val json = Json {
-        ignoreUnknownKeys = true
-    }
-
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> = Observable.fromCallable {
-        livewireMangaPage(
-            initialUrl = homeUrl(),
-            referer = "$baseUrl/",
-            updates = mapOf("selectedSort" to "popular"),
-            page = page,
-            paginator = HOME_PAGINATOR,
-        )
-    }
+    override fun popularMangaRequest(page: Int): Request = GET(
+        homeUrl(page, mapOf("selectedSort" to SORT_POPULAR)),
+        headers,
+    )
 
-    override fun popularMangaRequest(page: Int): Request = throw UnsupportedOperationException()
-
-    override fun popularMangaParse(response: Response): MangasPage = throw UnsupportedOperationException()
+    override fun popularMangaParse(response: Response): MangasPage = mangaPageParse(response)
 
     override fun latestUpdatesRequest(page: Int): Request = GET(homeUrl(page), headers)
 
@@ -94,36 +72,22 @@ class Jjaptoon :
                 throw UnsupportedOperationException("인기순은 상태 필터와 함께 사용할 수 없습니다.")
             }
 
-            return Observable.fromCallable {
-                livewireMangaPage(
-                    initialUrl = homeUrl(),
-                    referer = "$baseUrl/",
-                    updates = filters.livewireUpdates() + ("selectedSort" to SORT_POPULAR),
-                    page = page,
-                    paginator = HOME_PAGINATOR,
-                )
-            }
-        }
-
-        val updates = filters.livewireUpdates()
-        if (updates.isEmpty()) {
-            return client.newCall(searchMangaRequest(page, query, filters))
+            return client.newCall(
+                GET(homeUrl(page, filters.selectedParameters() + ("selectedSort" to SORT_POPULAR)), headers),
+            )
                 .asObservableSuccess()
                 .map(::searchMangaParse)
         }
 
-        return Observable.fromCallable {
-            livewireMangaPage(
-                initialUrl = comicsUrl(query = query),
-                referer = "$baseUrl/comics",
-                updates = updates,
-                page = page,
-                paginator = COMICS_PAGINATOR,
-            )
-        }
+        return client.newCall(searchMangaRequest(page, query, filters))
+            .asObservableSuccess()
+            .map(::searchMangaParse)
     }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET(comicsUrl(page, query), headers)
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET(
+        comicsUrl(page, query, filters.selectedParameters()),
+        headers,
+    )
 
     override fun searchMangaParse(response: Response): MangasPage = mangaPageParse(response)
 
@@ -136,107 +100,40 @@ class Jjaptoon :
         PublisherFilter(),
     )
 
-    private fun comicsUrl(page: Int = 1, query: String = ""): String = "$baseUrl/comics".toHttpUrl().newBuilder().apply {
-        if (query.isNotBlank()) {
-            addQueryParameter("search", query.trim())
-        }
-        if (page > 1) {
-            addQueryParameter("page", page.toString())
-        }
-    }.build().toString()
+    private fun comicsUrl(
+        page: Int = 1,
+        query: String = "",
+        parameters: Map<String, String> = emptyMap(),
+    ): String =
+        "$baseUrl/comics".toHttpUrl().newBuilder().apply {
+            if (query.isNotBlank()) {
+                addQueryParameter("search", query.trim())
+            }
+            parameters.forEach { (key, value) ->
+                addQueryParameter(key, value)
+            }
+            if (page > 1) {
+                addQueryParameter("page", page.toString())
+            }
+        }.build().toString()
 
-    private fun homeUrl(page: Int = 1): String = baseUrl.toHttpUrl().newBuilder().apply {
+    private fun homeUrl(
+        page: Int = 1,
+        parameters: Map<String, String> = emptyMap(),
+    ): String = baseUrl.toHttpUrl().newBuilder().apply {
+        parameters.forEach { (key, value) ->
+            addQueryParameter(key, value)
+        }
         if (page > 1) {
             addQueryParameter(HOME_PAGINATOR, page.toString())
         }
     }.build().toString()
 
-    private fun livewireMangaPage(
-        initialUrl: String,
-        referer: String,
-        updates: Map<String, String>,
-        page: Int,
-        paginator: String,
-    ): MangasPage {
-        val initialResponse = client.newCall(GET(initialUrl, headersBuilder().set("Referer", referer).build())).execute()
-        initialResponse.use {
-            val document = it.asJsoup()
-            val livewireBaseUrl = it.request.url.newBuilder()
-                .encodedPath("/")
-                .query(null)
-                .fragment(null)
-                .build()
-                .toString()
-                .trimEnd('/')
-            val livewireReferer = it.request.url.toString()
-            val token = document.selectFirst("script[data-csrf]")?.attr("data-csrf")
-                ?: throw IllegalStateException("Unable to find Livewire CSRF token")
-            val snapshot = document.getElementsByAttribute("wire:snapshot").first()?.attr("wire:snapshot")?.unescapeHtml()
-                ?: throw IllegalStateException("Unable to find Livewire snapshot")
-
-            val calls = if (page > 1) {
-                listOf(
-                    LivewireCall(
-                        method = "gotoPage",
-                        params = listOf(JsonPrimitive(page), JsonPrimitive(paginator)),
-                    ),
-                )
-            } else {
-                emptyList()
-            }
-
-            val livewireResponse = client.newCall(
-                livewireRequest(
-                    livewireBaseUrl = livewireBaseUrl,
-                    referer = livewireReferer,
-                    body = LivewireRequest(
-                        token = token,
-                        components = listOf(
-                            LivewireRequestComponent(
-                                snapshot = snapshot,
-                                updates = updates,
-                                calls = calls,
-                            ),
-                        ),
-                    ),
-                ),
-            ).execute()
-
-            livewireResponse.use { response ->
-                val html = json.decodeFromString<LivewireResponse>(response.body.string())
-                    .components
-                    .firstOrNull()
-                    ?.effects
-                    ?.html
-                    ?: throw IllegalStateException("Unable to parse Livewire response")
-
-                return mangaPageParse(Jsoup.parse(html, initialUrl))
-            }
-        }
-    }
-
-    private fun livewireRequest(livewireBaseUrl: String, referer: String, body: LivewireRequest): Request {
-        val requestBody = json.encodeToString(body).toRequestBody(JSON_MEDIA_TYPE)
-        val requestHeaders = headersBuilder()
-            .set("Accept", "*/*")
-            .set("Content-Type", JSON_MEDIA_TYPE.toString())
-            .set("Origin", livewireBaseUrl)
-            .set("Referer", referer)
-            .set("X-Livewire", "")
-            .build()
-
-        return Request.Builder()
-            .url("$livewireBaseUrl/livewire/update")
-            .headers(requestHeaders)
-            .post(requestBody)
-            .build()
-    }
-
-    private fun FilterList.livewireUpdates(): Map<String, String> = filterIsInstance<LivewireSelectFilter>()
+    private fun FilterList.selectedParameters(): Map<String, String> = filterIsInstance<QuerySelectFilter>()
         .mapNotNull { filter ->
             filter.selectedValue
                 .takeUnless { it == FILTER_ALL }
-                ?.let { filter.livewireKey to it }
+                ?.let { filter.queryParameter to it }
         }
         .toMap()
 
@@ -253,15 +150,17 @@ class Jjaptoon :
             .distinctBy { it.attr("href") }
             .mapNotNull(::mangaFromElement)
 
-        val hasNextPage = document.select("button")
-            .any { it.attr("wire:click").startsWith("nextPage") && !it.hasAttr("disabled") }
+        val hasNextPage = document.select("a[aria-label='Next page']").isNotEmpty() ||
+            document.select("button").any {
+                it.attr("wire:click").startsWith("nextPage") && !it.hasAttr("disabled")
+            }
 
         return MangasPage(mangas, hasNextPage)
     }
 
-    private abstract class LivewireSelectFilter(
+    private abstract class QuerySelectFilter(
         name: String,
-        val livewireKey: String,
+        val queryParameter: String,
         private val options: Array<Pair<String, String>>,
     ) : Filter.Select<String>(
         name,
@@ -284,7 +183,7 @@ class Jjaptoon :
     }
 
     private class TypeFilter :
-        LivewireSelectFilter(
+        QuerySelectFilter(
             "분류",
             "selectedType",
             arrayOf(
@@ -296,7 +195,7 @@ class Jjaptoon :
         )
 
     private class StatusFilter :
-        LivewireSelectFilter(
+        QuerySelectFilter(
             "상태",
             "selectedStatus",
             arrayOf(
@@ -308,7 +207,7 @@ class Jjaptoon :
         )
 
     private class ScheduleFilter :
-        LivewireSelectFilter(
+        QuerySelectFilter(
             "요일",
             "selectedSchedule",
             arrayOf(
@@ -324,7 +223,7 @@ class Jjaptoon :
         )
 
     private class CategoryFilter :
-        LivewireSelectFilter(
+        QuerySelectFilter(
             "장르",
             "selectedCategory",
             arrayOf(
@@ -356,7 +255,7 @@ class Jjaptoon :
         )
 
     private class PublisherFilter :
-        LivewireSelectFilter(
+        QuerySelectFilter(
             "플랫폼",
             "selectedPublisher",
             arrayOf(
@@ -385,43 +284,6 @@ class Jjaptoon :
                 "Other" to "other",
             ),
         )
-
-    @Serializable
-    private data class LivewireRequest(
-        @SerialName("_token") val token: String,
-        val components: List<LivewireRequestComponent>,
-    )
-
-    @Serializable
-    private data class LivewireRequestComponent(
-        val snapshot: String,
-        val updates: Map<String, String>,
-        val calls: List<LivewireCall>,
-    )
-
-    @Serializable
-    private data class LivewireCall(
-        val path: String = "",
-        val method: String,
-        val params: List<JsonElement>,
-    )
-
-    @Serializable
-    private data class LivewireResponse(
-        val components: List<LivewireResponseComponent>,
-    )
-
-    @Serializable
-    private data class LivewireResponseComponent(
-        val effects: LivewireEffects,
-    )
-
-    @Serializable
-    private data class LivewireEffects(
-        val html: String,
-    )
-
-    private fun String.unescapeHtml(): String = Parser.unescapeEntities(this, true)
 
     private fun mangaFromElement(element: Element): SManga? {
         val title = element.selectFirst("h2")?.text()?.trim()
@@ -479,7 +341,7 @@ class Jjaptoon :
         val document = response.asJsoup()
 
         return document.select("main img")
-            .mapNotNull { imageSrcRegex.find(it.attr(":src"))?.groupValues?.get(1) }
+            .mapNotNull { it.imageUrl() ?: imageSrcRegex.find(it.attr(":src"))?.groupValues?.get(1) }
             .distinct()
             .mapIndexed { index, imageUrl ->
                 Page(index, response.request.url.toString(), imageUrl.replace(" ", "%20"))
@@ -542,14 +404,11 @@ class Jjaptoon :
         private const val SORT_LATEST = "latest"
         private const val SORT_POPULAR = "popular"
         private const val HOME_PAGINATOR = "comicsPage"
-        private const val COMICS_PAGINATOR = "page"
 
         private val OLD_DEFAULT_BASE_URLS = setOf(
             "https://jjaptoon003.com",
             "https://jjabtoon003.com",
         )
-
-        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).apply {
             timeZone = TimeZone.getTimeZone("Asia/Seoul")
