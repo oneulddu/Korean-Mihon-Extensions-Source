@@ -34,7 +34,7 @@ class Jjaptoon :
 
     override val name = "짭툰"
 
-    private val defaultBaseUrl = "https://www.jjabtoon003.com"
+    private val defaultBaseUrl = "https://www.jjaptoon003.com"
 
     private val baseUrlPref = "overrideBaseUrl_v${AppInfo.getVersionName()}"
 
@@ -407,6 +407,7 @@ class Jjaptoon :
         private val OLD_DEFAULT_BASE_URLS = setOf(
             "https://jjaptoon003.com",
             "https://jjabtoon003.com",
+            "https://www.jjabtoon003.com",
         )
 
         private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).apply {
