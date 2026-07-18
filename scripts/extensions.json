@@ -5,11 +5,6 @@
         { "name": "블랙툰", "lang": "ko", "baseUrl": "https://blacktoon415.com" }
       ]
     },
-    "manatoki": {
-      "sources": [
-        { "name": "Manatoki", "lang": "ko", "baseUrl": "https://manatoki552.net", "versionId": 2 }
-      ]
-    },
     "navercomic": {
       "sources": [
         { "name": "Naver Webtoon", "lang": "ko", "baseUrl": "https://comic.naver.com" },
