@@ -280,7 +280,7 @@ class BlackToon :
         private const val USER_AGENT =
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
         private const val PREF_DOMAIN_NUMBER = "domain_number"
-        private const val DEFAULT_DOMAIN_NUMBER = "415"
+        private const val DEFAULT_DOMAIN_NUMBER = "416"
         private val dataScriptRegex = Regex("""loadScript\((?:inc_url\+)?['"](/data/webtoon/webtoon_\d+_\d+\.js)""")
         private val domainRegex = Regex("""blacktoon(\d+)\.com""")
     }
