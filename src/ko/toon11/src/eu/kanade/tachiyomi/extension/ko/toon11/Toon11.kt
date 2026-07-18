@@ -1,6 +1,11 @@
 package eu.kanade.tachiyomi.extension.ko.toon11
 
+import android.content.SharedPreferences
+import androidx.preference.EditTextPreference
+import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.AppInfo
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -10,6 +15,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -21,15 +27,23 @@ import java.text.SimpleDateFormat
 import java.util.ArrayList
 import java.util.Locale
 
-class Toon11 : HttpSource() {
+class Toon11 :
+    HttpSource(),
+    ConfigurableSource {
 
     override val name = "11toon"
 
-    override val baseUrl = "https://www.11toon.com"
+    private val defaultBaseUrl = "https://www.spotv148.com"
+
+    private val baseUrlPref = "overrideBaseUrl_v${AppInfo.getVersionName()}"
+
+    override val baseUrl by lazy { getPrefBaseUrl() }
 
     override val lang = "ko"
 
     override val supportsLatest = true
+
+    private val preferences: SharedPreferences by getPreferencesLazy()
 
     override fun popularMangaRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&is_over=0", headers)
 
@@ -184,6 +198,23 @@ class Toon11 : HttpSource() {
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        EditTextPreference(screen.context).apply {
+            key = baseUrlPref
+            title = BASE_URL_PREF_TITLE
+            summary = BASE_URL_PREF_SUMMARY
+            setDefaultValue(defaultBaseUrl)
+            dialogTitle = BASE_URL_PREF_TITLE
+            dialogMessage = "Default: $defaultBaseUrl"
+        }.also(screen::addPreference)
+    }
+
+    private fun getPrefBaseUrl(): String = preferences.getString(baseUrlPref, defaultBaseUrl)
+        ?.trim()
+        ?.trimEnd('/')
+        .takeUnless { it.isNullOrBlank() }
+        ?: defaultBaseUrl
+
     override fun getFilterList() = FilterList(
         Filter.Header("Note: can't combine search query with filters, status filter only has effect in 인기만화"),
         Filter.Separator(),
@@ -193,6 +224,9 @@ class Toon11 : HttpSource() {
     )
 
     companion object {
+        private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
+        private const val BASE_URL_PREF_SUMMARY = "Override default domain with a different one"
+
         private val dateFormat = SimpleDateFormat("yy.MM.dd", Locale.ENGLISH)
         private val imgListRegex = """img_list\s*=\s*(\[.*?])""".toRegex(RegexOption.DOT_MATCHES_ALL)
     }
