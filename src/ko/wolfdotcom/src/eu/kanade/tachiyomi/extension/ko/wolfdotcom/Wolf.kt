@@ -1,13 +1,11 @@
 package eu.kanade.tachiyomi.extension.ko.wolfdotcom
 
 import android.content.SharedPreferences
-import android.util.Log
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
-import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -25,7 +23,6 @@ import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
 import rx.Observable
 import java.io.IOException
 import java.net.URLEncoder
@@ -60,59 +57,11 @@ open class Wolf(
 
     override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = fetchSearchManga(page, "", LATEST)
 
-    private var searchFilters: List<FilterData> = emptyList()
-    private var filterParseError = false
-
-    override fun getFilterList(): FilterList {
-        val filters: MutableList<Filter<*>> = mutableListOf(
-            SortFilter(),
-        )
-
-        if (searchFilters.isNotEmpty()) {
-            filters.add(
-                SearchFilter(searchFilters),
-            )
-        } else if (filterParseError) {
-            filters.add(
-                Filter.Header("unable to parse filters"),
-            )
-        } else {
-            filters.add(
-                Filter.Header("press 'reset' to attempt to load more filters"),
-            )
-        }
-
-        return FilterList(filters)
-    }
-
-    protected open fun parseSearchFilters(document: Document) {
-        if (searchFilters.isNotEmpty() || filterParseError) return
-
-        try {
-            val displayName = document.select(".sub-tab > a").eachText()
-            assert(displayName.size == 3)
-            searchFilters =
-                document.select(".tab-day > a, .tab-genre1 > a, .tab-genre2 > a, .tab-alphabet > a")
-                    .map {
-                        val url = it.absUrl("href").toHttpUrl()
-                        val type = url.queryParameter("type1")!!
-                        FilterData(
-                            type = type,
-                            typeDisplayName = when (type) {
-                                "day", "complete" -> displayName[0]
-                                "genre" -> displayName[1]
-                                "alphabet" -> displayName[2]
-                                else -> null
-                            },
-                            value = url.queryParameter("type2"),
-                            valueDisplayName = it.ownText(),
-                        )
-                    }
-        } catch (e: Throwable) {
-            Log.e(name, "error parsing filters", e)
-            filterParseError = true
-        }
-    }
+    override fun getFilterList(): FilterList = FilterList(
+        SortFilter(),
+        TypeFilter(),
+        GenreFilter(),
+    )
 
     private lateinit var browseCache: List<List<BrowseItem>>
 
@@ -154,18 +103,18 @@ open class Wolf(
     private fun parseBrowsePage(response: Response) {
         val document = response.asJsoup()
 
-        parseSearchFilters(document)
-
-        browseCache = document.select(".webtoon-list > ul > li > a").map {
+        browseCache = document.select("a.t-card[href*=list]").mapNotNull {
             val id = it.absUrl("href").toHttpUrl()
-                .queryParameter("toon")!!.toInt()
+                .queryParameter("toon")?.toIntOrNull()
+                ?: return@mapNotNull null
 
             BrowseItem(
                 id = id,
-                title = it.selectFirst(".txt > .subject")!!.ownText(),
-                cover = it.selectFirst(".img > img")?.attr("data-original"),
+                title = it.selectFirst(".t-title")?.text()?.trim()
+                    ?: return@mapNotNull null,
+                cover = it.selectFirst(".t-img img")?.absUrl("src"),
             )
-        }.chunked(20)
+        }.chunked(20).ifEmpty { listOf(emptyList()) }
     }
 
     private fun paginatedBrowsePage(index: Int): MangasPage = MangasPage(
@@ -179,37 +128,27 @@ open class Wolf(
         browseCache.lastIndex > index,
     )
 
-    private val specialChars = Regex("""[^\p{InHangul_Syllables}0-9a-z ]""", RegexOption.IGNORE_CASE)
-    private val styleImage = Regex("""background-image:url\(([^)]+)\)""")
-
     private fun querySearch(query: String): Observable<MangasPage> {
         if (query.length < 2) {
             throw Exception("두 글자 이상 입력 해주세요.")
         }
-        val stdQuery = query.replace(specialChars, "")
-        val searchUrl = "$baseUrl/search.html?q=${URLEncoder.encode(stdQuery, "EUC-KR")}"
+        val searchUrl = "$baseUrl/sh?q=${URLEncoder.encode(query.trim(), "EUC-KR")}"
 
         return client.newCall(GET(searchUrl, headers))
             .asObservableSuccess()
             .map { response ->
                 val document = Jsoup.parseBodyFragment(response.body.string(), searchUrl)
-                val entries = document.select("article.searchItem")
-                    .filter { el ->
-                        el.selectFirst("a.searchLink")!!.attr("href").contains(entryPath)
+                val entries = document.select("a.t-card[href*=list]").mapNotNull { element ->
+                    val mangaUrl = element.absUrl("href").toHttpUrl()
+                    val id = mangaUrl.queryParameter("toon") ?: return@mapNotNull null
+                    val title = element.selectFirst(".t-title")?.text()?.trim() ?: return@mapNotNull null
+
+                    SManga.create().apply {
+                        url = id
+                        this.title = title
+                        thumbnail_url = element.selectFirst(".t-img img")?.absUrl("src")
                     }
-                    .map { el ->
-                        val mangaUrl = el.selectFirst("a.searchLink")!!.absUrl("href")
-                            .toHttpUrl()
-                        SManga.create().apply {
-                            url = mangaUrl.queryParameter("toon")!!
-                            title = el.selectFirst(".searchDetailTitle")!!.text()
-                            thumbnail_url = el.selectFirst(".searchPng")
-                                ?.attr("style")
-                                ?.let {
-                                    styleImage.find(it)?.groupValues?.get(1)
-                                }
-                        }
-                    }
+                }
 
                 MangasPage(entries, false)
             }
@@ -226,11 +165,13 @@ open class Wolf(
         val document = response.asJsoup()
 
         return SManga.create().apply {
-            title = document.selectFirst(".text-box h1")!!.text()
-            thumbnail_url = document.selectFirst(".img-box img")?.absUrl("src")
-            description = document.selectFirst(".text-box .txt")?.text()
-            genre = document.selectFirst(".text-box .sub:has(> strong:contains(장르))")?.ownText()?.replace("/", ", ")
-            author = document.selectFirst(".text-box .sub:has(> strong:contains(작가))")?.ownText()?.replace("/", ", ")
+            title = document.selectFirst(".w-title")?.text()?.trim().orEmpty()
+            thumbnail_url = document.selectFirst(".thumb-wrap img")?.absUrl("src")
+            description = document.selectFirst("#summary")?.text()?.trim()
+            genre = document.select(".genre-tags .gtag")
+                .eachText()
+                .joinToString()
+                .takeIf { it.isNotBlank() }
         }
     }
 
@@ -245,20 +186,23 @@ open class Wolf(
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
 
-        return document.select(".webtoon-bbs-list a.view_open").map { el ->
+        return document.select("a.ep-item[href*=view]").mapNotNull { el ->
             val chapUrl = el.absUrl("href").toHttpUrl()
+            val toon = chapUrl.queryParameter("toon") ?: return@mapNotNull null
+            val num = chapUrl.queryParameter("num") ?: return@mapNotNull null
             SChapter.create().apply {
                 url = ChapterUrl(
-                    chapUrl.queryParameter("toon")!!,
-                    chapUrl.queryParameter("num")!!,
+                    toon,
+                    num,
                 ).toJsonString()
-                name = el.selectFirst(".subject")!!.ownText()
-                date_upload = dateFormat.tryParse(el.selectFirst(".date")?.text())
+                name = el.selectFirst(".ep-title")?.text()?.trim().orEmpty()
+                chapter_number = num.toFloatOrNull() ?: -1f
+                date_upload = dateFormat.tryParse(el.selectFirst(".ep-date")?.text())
             }
         }
     }
 
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT)
 
     override fun getChapterUrl(chapter: SChapter): String {
         val chapUrl = chapter.url.parseAs<ChapterUrl>()
@@ -275,8 +219,8 @@ open class Wolf(
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
 
-        return document.select(".image-view img").mapIndexed { idx, img ->
-            Page(idx, imageUrl = img.absUrl("data-original"))
+        return document.select(".viewer-wrap img[data-src]").mapIndexed { idx, img ->
+            Page(idx, imageUrl = img.absUrl("data-src"))
         }
     }
 
