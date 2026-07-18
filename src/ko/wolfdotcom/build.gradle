@@ -1,7 +1,7 @@
 ext {
     extName = 'Wolf.com'
     extClass = '.WolfFactory'
-    extVersionCode = 3
+    extVersionCode = 4
     isNsfw = true
 }
 
@@ -14,7 +14,7 @@ androidComponents {
             def variantName = variant.name.capitalize()
 
             def task = tasks.register("update${variantName}DomainNumber", UpdateDomainNumberTask) {
-                defaultDomainNumber.set(393)
+                defaultDomainNumber.set(421)
 
                 outputs.upToDateWhen { false }
             }

@@ -8,30 +8,56 @@ interface UrlPartFilter {
     fun addToUrl(url: HttpUrl.Builder)
 }
 
-class FilterData(
-    val type: String,
-    private val typeDisplayName: String? = null,
-    val value: String?,
-    private val valueDisplayName: String,
-) {
-    override fun toString(): String = "$typeDisplayName: $valueDisplayName"
-}
-
-class SearchFilter(
-    private val options: List<FilterData>,
+abstract class QueryFilter(
+    name: String,
+    private val parameter: String,
+    private val options: Array<Pair<String, String>>,
 ) : Filter.Select<String>(
-    "필터",
-    options.map { it.toString() }.toTypedArray(),
+    name,
+    options.map { it.first }.toTypedArray(),
 ),
     UrlPartFilter {
     override fun addToUrl(url: HttpUrl.Builder) {
-        val selected = options[state]
-        url.addQueryParameter("type1", selected.type)
-        selected.value?.let {
-            url.addQueryParameter("type2", it)
+        options[state].second.takeIf { it.isNotEmpty() }?.let {
+            url.addQueryParameter(parameter, it)
         }
     }
 }
+
+class TypeFilter :
+    QueryFilter(
+        "분류",
+        "t2",
+        arrayOf(
+            "전체" to "",
+            "일반" to "1",
+            "BL" to "2",
+            "성인" to "3",
+        ),
+    )
+
+class GenreFilter :
+    QueryFilter(
+        "장르",
+        "t3",
+        arrayOf(
+            "전체" to "",
+            "드라마" to "드라마",
+            "판타지" to "판타지",
+            "액션" to "액션",
+            "로맨스" to "로맨스",
+            "일상" to "일상",
+            "개그" to "개그",
+            "미스터리" to "미스터리",
+            "순정" to "순정",
+            "스포츠" to "스포츠",
+            "스릴러" to "스릴러",
+            "무협" to "무협",
+            "학원" to "학원",
+            "공포" to "공포",
+            "스토리" to "스토리",
+        ),
+    )
 
 class SortFilter(default: Int = 0) :
     Filter.Select<String>(
