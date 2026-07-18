@@ -2,7 +2,7 @@
   "extensions": {
     "blacktoon": {
       "sources": [
-        { "name": "블랙툰", "lang": "ko", "baseUrl": "https://blacktoon415.com" }
+        { "name": "블랙툰", "lang": "ko", "baseUrl": "https://blacktoon416.com" }
       ]
     },
     "navercomic": {
