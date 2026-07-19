@@ -34,6 +34,7 @@ open class Wolf(
     private val browsePath: String,
     private val entryPath: String,
     private val readerPath: String,
+    private val filters: () -> FilterList,
 ) : HttpSource(),
     ConfigurableSource {
 
@@ -53,15 +54,11 @@ open class Wolf(
 
     private val preference: SharedPreferences by getPreferencesLazy()
 
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> = fetchSearchManga(page, "", POPULAR)
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> = fetchSearchManga(page, "", FilterList(SortFilter(1)))
 
-    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = fetchSearchManga(page, "", LATEST)
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = fetchSearchManga(page, "", FilterList(SortFilter()))
 
-    override fun getFilterList(): FilterList = FilterList(
-        SortFilter(),
-        TypeFilter(),
-        GenreFilter(),
-    )
+    override fun getFilterList(): FilterList = filters()
 
     private lateinit var browseCache: List<List<BrowseItem>>
 
@@ -186,7 +183,7 @@ open class Wolf(
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
 
-        return document.select("a.ep-item[href*=view]").mapNotNull { el ->
+        return document.select("a.ep-item[href*=$readerPath]").mapNotNull { el ->
             val chapUrl = el.absUrl("href").toHttpUrl()
             val toon = chapUrl.queryParameter("toon") ?: return@mapNotNull null
             val num = chapUrl.queryParameter("num") ?: return@mapNotNull null
