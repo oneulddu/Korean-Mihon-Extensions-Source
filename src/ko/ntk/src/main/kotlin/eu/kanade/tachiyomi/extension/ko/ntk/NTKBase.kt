@@ -37,6 +37,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.IOException
 import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -47,6 +48,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+
+private class AdAcknowledgmentRequiredException(message: String) : IOException(message)
 
 abstract class NTKBase(
     override val name: String,
@@ -65,10 +68,20 @@ abstract class NTKBase(
 
     protected val rootUrl: String
         get() {
-            val stored = preferences.getString(PREF_DOMAIN_KEY, PREF_DOMAIN_DEFAULT)!!
-            val domainNumber = stored.trimStart('0').ifEmpty { "0" }
-            if (domainNumber != stored) {
-                preferences.edit().putString(PREF_DOMAIN_KEY, domainNumber).apply()
+            val stored = preferences.getString(PREF_DOMAIN_KEY, null)
+            val normalizedStored = stored?.trim()?.trimStart('0')?.ifEmpty { "0" }
+            val previousDefault = preferences.getString(PREF_DOMAIN_DEFAULT_KEY, null)
+            val domainNumber = when {
+                normalizedStored == null -> PREF_DOMAIN_DEFAULT
+                normalizedStored == PREVIOUS_DOMAIN_DEFAULT && previousDefault != PREF_DOMAIN_DEFAULT -> PREF_DOMAIN_DEFAULT
+                else -> normalizedStored
+            }
+
+            if (domainNumber != stored || previousDefault != PREF_DOMAIN_DEFAULT) {
+                preferences.edit()
+                    .putString(PREF_DOMAIN_KEY, domainNumber)
+                    .putString(PREF_DOMAIN_DEFAULT_KEY, PREF_DOMAIN_DEFAULT)
+                    .apply()
             }
             return "https://sbxh$domainNumber.com"
         }
@@ -504,7 +517,10 @@ abstract class NTKBase(
     }
 
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
-    private fun loadChapterHtmlWithWebView(request: Request): String? {
+    private fun loadChapterHtmlWithWebView(
+        request: Request,
+        waitForAdAcknowledgment: Boolean = false,
+    ): String? {
         val finalHtml = AtomicReference<String?>(null)
         val isComplete = AtomicBoolean(false)
         val latch = CountDownLatch(1)
@@ -543,7 +559,8 @@ abstract class NTKBase(
             webView.addJavascriptInterface(
                 object {
                     @JavascriptInterface
-                    fun collectHtml(html: String) {
+                    fun collectHtml(html: String, adAcknowledged: Boolean) {
+                        if (waitForAdAcknowledgment && !adAcknowledged) return
                         completeWith(html)
                     }
                 },
@@ -555,7 +572,10 @@ abstract class NTKBase(
                     """
                         (function() {
                             try {
-                                window.NTKHtmlBridge.collectHtml(document.documentElement.outerHTML || '');
+                                window.NTKHtmlBridge.collectHtml(
+                                    document.documentElement.outerHTML || '',
+                                    window.__ntk_ad_ack_scope === window.location.pathname,
+                                );
                             } catch (_) {}
                         })();
                     """.trimIndent(),
@@ -777,11 +797,11 @@ abstract class NTKBase(
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
-        return document.select("ul.ep-list-v2 > li.ep-row-v2").map { element ->
+        return document.select("a.ep-row-v2-link[href]").map { element ->
             SChapter.create().apply {
-                setUrlWithoutDomain(element.select("a.ep-row-v2-link").attr("href"))
-                name = element.select("div.ep-row-v2-title strong").text()
-                date_upload = dateFormat.tryParse(element.select("span.ep-row-v2-date").text())
+                setUrlWithoutDomain(element.attr("href"))
+                name = element.select(".ep-row-v2-title strong, .ep-row-v2-title").text()
+                date_upload = dateFormat.tryParse(element.select(".ep-row-v2-date").text())
             }
         }
     }
@@ -807,7 +827,17 @@ abstract class NTKBase(
             ?.takeIf(::isValidNvCookie)
             ?: issueNvCookie(referer)
 
-        val data = fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
+        val data = try {
+            fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
+        } catch (error: AdAcknowledgmentRequiredException) {
+            val acknowledgedHtml = loadChapterHtmlWithWebView(
+                response.request,
+                waitForAdAcknowledgment = true,
+            ) ?: throw error
+            val refreshedToken = extractHtmlString(acknowledgedHtml, "imagesToken") ?: throw error
+            val refreshedNvCookie = issueNvCookie(referer)
+            fetchPageImages(workId, episodeId, refreshedToken, refreshedNvCookie, referer)
+        }
         return data.images.sortedWith(compareBy<PageImage> { it.page ?: Int.MAX_VALUE }.thenBy { it.src })
             .mapIndexed { i, image ->
                 val imageUrl = chapterUrl.resolve(image.src)?.toString() ?: image.src
@@ -881,6 +911,9 @@ abstract class NTKBase(
         responseBody: String,
         referer: String,
     ): PageImagesResponse {
+        if (responseBody.contains("ad acknowledgment required", ignoreCase = true)) {
+            throw AdAcknowledgmentRequiredException("NTK image API requires ad acknowledgment for $referer")
+        }
         if (!isSuccessful) {
             throw Exception("NTK image API failed: HTTP $code for $referer: ${responseBody.take(500)}")
         }
@@ -1075,7 +1108,9 @@ abstract class NTKBase(
         private const val WEBVIEW_HTML_FALLBACK_HEADER = "X-WebView-Html-Fallback"
         private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         private const val PREF_DOMAIN_KEY = "pref_domain_key"
-        private const val PREF_DOMAIN_DEFAULT = "3"
+        private const val PREF_DOMAIN_DEFAULT_KEY = "pref_domain_default_key"
+        private const val PREVIOUS_DOMAIN_DEFAULT = "3"
+        private const val PREF_DOMAIN_DEFAULT = "9"
         const val PAGE_SIZE = 49
     }
 }
