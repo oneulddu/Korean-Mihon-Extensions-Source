@@ -14,8 +14,8 @@
     },
     "ntk": {
       "sources": [
-        { "name": "NTK Manga", "lang": "ko", "baseUrl": "https://sbxh3.com/manhwa" },
-        { "name": "NTK Webtoon", "lang": "ko", "baseUrl": "https://sbxh3.com/ing" }
+        { "name": "NTK Manga", "lang": "ko", "baseUrl": "https://sbxh9.com/manhwa" },
+        { "name": "NTK Webtoon", "lang": "ko", "baseUrl": "https://sbxh9.com/ing" }
       ]
     },
     "rawdex": {
