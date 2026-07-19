@@ -24,6 +24,7 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -38,7 +39,14 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.IOException
+import java.nio.charset.StandardCharsets
+import java.security.KeyPairGenerator
+import java.security.MessageDigest
+import java.security.PrivateKey
 import java.security.SecureRandom
+import java.security.Signature
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
@@ -56,6 +64,13 @@ private class ImageApiRequestException(
     message: String,
 ) : IOException(message)
 
+private data class ClientSigningKey(
+    val keyId: String,
+    val privateKey: PrivateKey,
+    val expiresAt: Long,
+    val serverTimeOffsetMs: Long,
+)
+
 abstract class NTKBase(
     override val name: String,
     protected val contentKind: String,
@@ -70,6 +85,7 @@ abstract class NTKBase(
     override val lang = "ko"
     override val supportsLatest = true
     protected val preferences by getPreferencesLazy()
+    private val clientSigningKey = AtomicReference<ClientSigningKey?>(null)
 
     protected val rootUrl: String
         get() {
@@ -328,7 +344,7 @@ abstract class NTKBase(
                 .build()
             val response = chain.proceed(cleanRequest)
             val preview = response.peekBody(1_000_000).string()
-            val shouldOpenWebView = response.code in CLOUDFLARE_ERROR_CODES ||
+            val shouldOpenWebView = response.code in CLOUDFLARE_HTML_ERROR_CODES ||
                 isCloudflareChallengeHtml(preview) ||
                 extractHtmlString(preview, "imagesToken") == null
 
@@ -697,6 +713,29 @@ abstract class NTKBase(
         val proof: String,
     )
 
+    @Serializable
+    private data class ClientPublicKey(
+        val crv: String = "P-256",
+        val ext: Boolean = true,
+        @SerialName("key_ops") val keyOps: List<String> = listOf("verify"),
+        val kty: String = "EC",
+        val x: String,
+        val y: String,
+    )
+
+    @Serializable
+    private data class ClientKeyRegistrationRequest(
+        val publicKey: ClientPublicKey,
+    )
+
+    @Serializable
+    private data class ClientKeyRegistrationResponse(
+        val ok: Boolean = false,
+        val keyId: String? = null,
+        val expiresAt: Long? = null,
+        val serverNow: Long? = null,
+    )
+
     protected fun htmlCardParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val mangas = document.select("div.card-grid > a.card").map { element ->
@@ -927,7 +966,7 @@ abstract class NTKBase(
         val data = try {
             fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
         } catch (_: AdAcknowledgmentRequiredException) {
-            fetchPageImagesWithWebView(referer)
+            fetchPageImagesAfterAdAcknowledgment(response.request, workId, episodeId, referer)
         } catch (error: ImageApiRequestException) {
             if (!shouldUseWebViewForImageApi(error.code)) throw error
             fetchPageImagesWithWebView(referer)
@@ -951,7 +990,7 @@ abstract class NTKBase(
         fun buildRequest(): Request {
             val nonce = randomBase64Url(24)
             val proof = hmacSha256Base64Url(nvCookie, "$imagesToken.$nonce.$userAgent")
-            val body = json.encodeToString(
+            val bodyText = json.encodeToString(
                 ImageApiRequest(
                     workId = workId,
                     episodeId = episodeId,
@@ -959,7 +998,16 @@ abstract class NTKBase(
                     nonce = nonce,
                     proof = proof,
                 ),
-            ).toRequestBody(JSON_MEDIA_TYPE)
+            )
+            val endpointPath = "/api/$contentKind-images"
+            val cookie = webViewCookieHeader(referer, "nv=$nvCookie")
+            val signatureHeaders = createClientSignatureHeaders(
+                endpointPath,
+                Request.Builder().url(referer).build().url.encodedPath,
+                bodyText,
+                referer,
+                cookie,
+            )
 
             val requestHeaders = headers.newBuilder()
                 .set("Accept", "application/json")
@@ -970,15 +1018,17 @@ abstract class NTKBase(
                 .set("Referer", referer)
                 .set("User-Agent", userAgent)
                 .set("x-images-client", "viewer-v1")
+                .set("x-nv-session", nvCookie)
                 .apply {
-                    webViewCookieHeader(referer, "nv=$nvCookie")?.let { set("Cookie", it) }
+                    cookie?.let { set("Cookie", it) }
+                    signatureHeaders.forEach { (name, value) -> set(name, value) }
                 }
                 .build()
 
             return Request.Builder()
-                .url("$rootUrl/api/$contentKind-images")
+                .url(rootUrl + endpointPath)
                 .headers(requestHeaders)
-                .post(body)
+                .post(bodyText.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
         }
 
@@ -1029,6 +1079,283 @@ abstract class NTKBase(
     }
 
     private fun shouldUseWebViewForImageApi(code: Int): Boolean = code == HTTP_FORBIDDEN || code == HTTP_PRECONDITION_REQUIRED
+
+    private fun fetchPageImagesAfterAdAcknowledgment(
+        request: Request,
+        workId: String,
+        episodeId: String,
+        referer: String,
+    ): PageImagesResponse {
+        val acknowledgedHtml = loadChapterHtmlWithWebView(
+            request,
+            waitForAdAcknowledgment = true,
+        ) ?: return fetchPageImagesWithWebView(referer)
+        val token = extractHtmlString(acknowledgedHtml, "imagesToken") ?: return fetchPageImagesWithWebView(referer)
+        val nvCookie = issueNvCookie(referer)
+
+        return try {
+            fetchPageImages(workId, episodeId, token, nvCookie, referer)
+        } catch (_: AdAcknowledgmentRequiredException) {
+            fetchPageImagesWithWebView(referer)
+        } catch (error: ImageApiRequestException) {
+            if (!shouldUseWebViewForImageApi(error.code)) throw error
+            fetchPageImagesWithWebView(referer)
+        }
+    }
+
+    private fun createClientSignatureHeaders(
+        endpointPath: String,
+        scopePath: String,
+        bodyText: String,
+        referer: String,
+        cookie: String?,
+    ): Map<String, String> {
+        if (contentKind != "manhwa") return emptyMap()
+
+        val signingKey = getClientSigningKey(referer, cookie) ?: return emptyMap()
+        val timestamp = System.currentTimeMillis() + signingKey.serverTimeOffsetMs
+        val nonce = randomBase64Url(24)
+        val bodyHash = sha256Base64Url(bodyText)
+        val payload = listOf(
+            "ntk-brsig-v1",
+            "POST",
+            endpointPath,
+            scopePath,
+            signingKey.keyId,
+            timestamp.toString(),
+            nonce,
+            bodyHash,
+        ).joinToString("\n")
+        val signature = runCatching {
+            Signature.getInstance("SHA256withECDSA").run {
+                initSign(signingKey.privateKey)
+                update(payload.toByteArray(StandardCharsets.UTF_8))
+                derEcdsaToP1363(sign())
+            }
+        }.getOrNull() ?: return emptyMap()
+
+        return mapOf(
+            "x-ntk-key-id" to signingKey.keyId,
+            "x-ntk-ts" to timestamp.toString(),
+            "x-ntk-nonce" to nonce,
+            "x-ntk-sig" to base64Url(signature),
+        )
+    }
+
+    private fun getClientSigningKey(referer: String, cookie: String?): ClientSigningKey? {
+        val now = System.currentTimeMillis()
+        clientSigningKey.get()?.takeIf { it.expiresAt > now + CLIENT_KEY_RENEWAL_MARGIN_MS }?.let { return it }
+
+        return synchronized(clientSigningKey) {
+            clientSigningKey.get()?.takeIf { it.expiresAt > now + CLIENT_KEY_RENEWAL_MARGIN_MS } ?: run {
+                val keyPair = runCatching {
+                    KeyPairGenerator.getInstance("EC").apply {
+                        initialize(ECGenParameterSpec("secp256r1"))
+                    }.generateKeyPair()
+                }.getOrNull() ?: return@synchronized null
+                val publicKey = keyPair.public as? ECPublicKey ?: return@synchronized null
+                val requestBody = json.encodeToString(
+                    ClientKeyRegistrationRequest(
+                        ClientPublicKey(
+                            x = base64Url(unsignedCoordinate(publicKey.w.affineX.toByteArray())),
+                            y = base64Url(unsignedCoordinate(publicKey.w.affineY.toByteArray())),
+                        ),
+                    ),
+                )
+                val registration = registerClientKey(requestBody, referer, cookie)
+                    ?.takeIf(::isValidClientKeyRegistration)
+                    ?: registerClientKeyWithWebView(requestBody, referer)
+                    ?: return@synchronized null
+                val keyId = registration.keyId ?: return@synchronized null
+                val serverNow = registration.serverNow ?: now
+                val serverExpiresAt = registration.expiresAt ?: serverNow + CLIENT_KEY_DEFAULT_TTL_MS
+                ClientSigningKey(
+                    keyId = keyId,
+                    privateKey = keyPair.private,
+                    expiresAt = now + (serverExpiresAt - serverNow),
+                    serverTimeOffsetMs = serverNow - now,
+                ).also(clientSigningKey::set)
+            }
+        }
+    }
+
+    private fun isValidClientKeyRegistration(registration: ClientKeyRegistrationResponse): Boolean = registration.ok && registration.keyId?.let(CLIENT_KEY_ID_REGEX::matches) == true
+
+    private fun registerClientKey(
+        requestBody: String,
+        referer: String,
+        cookie: String?,
+    ): ClientKeyRegistrationResponse? = runCatching {
+        val request = Request.Builder()
+            .url("$rootUrl/api/client-key/register")
+            .headers(
+                headers.newBuilder()
+                    .set("Accept", "application/json")
+                    .set("Content-Type", "application/json")
+                    .set("Origin", rootUrl)
+                    .set("Referer", referer)
+                    .apply { cookie?.let { set("Cookie", it) } }
+                    .build(),
+            )
+            .post(requestBody.toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@use null
+            json.decodeFromString<ClientKeyRegistrationResponse>(response.body.string())
+        }
+    }.getOrNull()
+
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
+    private fun registerClientKeyWithWebView(
+        requestBody: String,
+        referer: String,
+    ): ClientKeyRegistrationResponse? {
+        val result = AtomicReference<ClientKeyRegistrationResponse?>(null)
+        val completed = AtomicBoolean(false)
+        val latch = CountDownLatch(1)
+        val handler = Handler(Looper.getMainLooper())
+        val webViewRef = AtomicReference<WebView?>(null)
+
+        fun completeRegistration(responseBody: String) {
+            val registration = runCatching {
+                json.decodeFromString<ClientKeyRegistrationResponse>(responseBody)
+            }.getOrNull() ?: return
+            if (
+                isValidClientKeyRegistration(registration) &&
+                completed.compareAndSet(false, true)
+            ) {
+                result.set(registration)
+                latch.countDown()
+            }
+        }
+
+        handler.post {
+            val webView = WebView(Injekt.get<Application>())
+            webViewRef.set(webView)
+            webView.settings.javaScriptEnabled = true
+            webView.settings.domStorageEnabled = true
+            webView.settings.loadsImagesAutomatically = true
+            webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+            webView.settings.userAgentString = DEFAULT_USER_AGENT
+            android.webkit.CookieManager.getInstance().setAcceptCookie(true)
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+
+            webView.addJavascriptInterface(
+                object {
+                    @JavascriptInterface
+                    fun complete(responseBody: String) = completeRegistration(responseBody)
+                },
+                "NTKClientKeyBridge",
+            )
+
+            fun submitRegistration() {
+                if (completed.get()) return
+                webView.evaluateJavascript(
+                    """
+                        (function() {
+                            fetch('/api/client-key/register', {
+                                method: 'POST',
+                                credentials: 'include',
+                                cache: 'no-store',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: ${json.encodeToString(requestBody)},
+                            })
+                                .then(function(response) { return response.text(); })
+                                .then(function(body) { window.NTKClientKeyBridge.complete(body); })
+                                .catch(function() {});
+                        })();
+                    """.trimIndent(),
+                    null,
+                )
+            }
+
+            webView.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView, url: String) {
+                    listOf(1_000L, 3_000L, 6_000L, 9_000L).forEach { delay ->
+                        handler.postDelayed(::submitRegistration, delay)
+                    }
+                    super.onPageFinished(view, url)
+                }
+            }
+            webView.loadUrl(referer)
+        }
+
+        latch.await(CLIENT_KEY_WEBVIEW_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        android.webkit.CookieManager.getInstance().flush()
+        handler.post { webViewRef.getAndSet(null)?.destroy() }
+        return result.get()
+    }
+
+    private fun unsignedCoordinate(value: ByteArray): ByteArray {
+        val bytes = value.dropWhile { it == 0.toByte() }.toByteArray()
+        if (bytes.size > P256_COORDINATE_SIZE) throw IllegalArgumentException("Invalid P-256 coordinate")
+        return ByteArray(P256_COORDINATE_SIZE).also { target ->
+            bytes.copyInto(target, P256_COORDINATE_SIZE - bytes.size)
+        }
+    }
+
+    private fun sha256Base64Url(value: String): String = base64Url(
+        MessageDigest.getInstance("SHA-256").digest(value.toByteArray(StandardCharsets.UTF_8)),
+    )
+
+    private fun derEcdsaToP1363(der: ByteArray): ByteArray {
+        var index = 0
+        if (der.getOrNull(index++) != ASN1_SEQUENCE) throw IllegalArgumentException("Invalid ECDSA signature")
+        val (sequenceLength, sequenceStart) = readAsn1Length(der, index)
+        index = sequenceStart
+        if (index + sequenceLength != der.size) throw IllegalArgumentException("Invalid ECDSA signature length")
+
+        val r = readAsn1Integer(der, index)
+        index = r.nextIndex
+        val s = readAsn1Integer(der, index)
+        if (s.nextIndex != der.size) throw IllegalArgumentException("Invalid ECDSA signature")
+
+        return ByteArray(P256_SIGNATURE_SIZE).also { signature ->
+            r.value.copyInto(signature, P256_COORDINATE_SIZE - r.value.size)
+            s.value.copyInto(signature, P256_SIGNATURE_SIZE - s.value.size)
+        }
+    }
+
+    private data class Asn1Integer(
+        val value: ByteArray,
+        val nextIndex: Int,
+    )
+
+    private fun readAsn1Integer(bytes: ByteArray, index: Int): Asn1Integer {
+        if (bytes.getOrNull(index) != ASN1_INTEGER) throw IllegalArgumentException("Invalid ECDSA integer")
+        val (length, valueStart) = readAsn1Length(bytes, index + 1)
+        val valueEnd = valueStart + length
+        if (valueEnd > bytes.size) throw IllegalArgumentException("Invalid ECDSA integer length")
+        val encodedValue = bytes.copyOfRange(valueStart, valueEnd)
+        if (
+            encodedValue.isEmpty() ||
+            encodedValue[0].toInt() and 0x80 != 0 ||
+            (encodedValue.size > 1 && encodedValue[0] == 0.toByte() && encodedValue[1].toInt() and 0x80 == 0)
+        ) {
+            throw IllegalArgumentException("Invalid ECDSA integer encoding")
+        }
+        val value = encodedValue
+            .dropWhile { it == 0.toByte() }
+            .toByteArray()
+        if (value.isEmpty() || value.size > P256_COORDINATE_SIZE) {
+            throw IllegalArgumentException("Invalid ECDSA integer value")
+        }
+        return Asn1Integer(value, valueEnd)
+    }
+
+    private fun readAsn1Length(bytes: ByteArray, index: Int): Pair<Int, Int> {
+        val first = bytes.getOrNull(index)?.toInt()?.and(0xff)
+            ?: throw IllegalArgumentException("Missing ASN.1 length")
+        if (first and ASN1_LONG_FORM_FLAG == 0) return first to index + 1
+
+        val count = first and ASN1_LENGTH_MASK
+        if (count !in 1..4 || index + count >= bytes.size) throw IllegalArgumentException("Invalid ASN.1 length")
+        var length = 0
+        repeat(count) { offset ->
+            length = length shl 8 or (bytes[index + 1 + offset].toInt() and 0xff)
+        }
+        return length to index + 1 + count
+    }
 
     private fun fetchPageImagesWithWebView(referer: String): PageImagesResponse {
         val request = GET(
@@ -1166,7 +1493,7 @@ abstract class NTKBase(
 
     private fun isCloudflareApiResponse(code: Int, body: String): Boolean {
         val trimmed = body.trimStart()
-        return code in CLOUDFLARE_ERROR_CODES ||
+        return code == HTTP_SERVICE_UNAVAILABLE ||
             isCloudflareChallengeHtml(body) ||
             trimmed.startsWith("<!DOCTYPE", ignoreCase = true) ||
             trimmed.startsWith("<html", ignoreCase = true)
@@ -1188,8 +1515,10 @@ abstract class NTKBase(
     private fun randomBase64Url(size: Int): String {
         val bytes = ByteArray(size)
         secureRandom.nextBytes(bytes)
-        return Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+        return base64Url(bytes)
     }
+
+    private fun base64Url(bytes: ByteArray): String = Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
 
     private fun hmacSha256Base64Url(key: String, message: String): String {
         val mac = Mac.getInstance("HmacSHA256")
@@ -1225,11 +1554,22 @@ abstract class NTKBase(
         private val secureRandom = SecureRandom()
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val HTML_MEDIA_TYPE = "text/html; charset=utf-8".toMediaType()
-        private val CLOUDFLARE_ERROR_CODES = listOf(403, 503)
+        private val CLOUDFLARE_HTML_ERROR_CODES = listOf(403, 503)
         private const val WEBVIEW_HTML_FALLBACK_HEADER = "X-WebView-Html-Fallback"
         private const val WEBVIEW_IMAGE_FALLBACK_HEADER = "X-WebView-Intercept"
         private const val HTTP_FORBIDDEN = 403
         private const val HTTP_PRECONDITION_REQUIRED = 428
+        private const val HTTP_SERVICE_UNAVAILABLE = 503
+        private const val CLIENT_KEY_DEFAULT_TTL_MS = 60 * 60 * 1000L
+        private const val CLIENT_KEY_RENEWAL_MARGIN_MS = 5 * 60 * 1000L
+        private const val CLIENT_KEY_WEBVIEW_TIMEOUT_SECONDS = 12L
+        private const val P256_COORDINATE_SIZE = 32
+        private const val P256_SIGNATURE_SIZE = P256_COORDINATE_SIZE * 2
+        private const val ASN1_LONG_FORM_FLAG = 0x80
+        private const val ASN1_LENGTH_MASK = 0x7f
+        private val ASN1_SEQUENCE = 0x30.toByte()
+        private val ASN1_INTEGER = 0x02.toByte()
+        private val CLIENT_KEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
         private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         private const val PREF_DOMAIN_KEY = "pref_domain_key"
         private const val PREF_DOMAIN_DEFAULT_KEY = "pref_domain_default_key"
