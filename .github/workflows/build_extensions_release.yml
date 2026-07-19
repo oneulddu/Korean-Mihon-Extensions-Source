@@ -127,12 +127,16 @@ jobs:
           fi
           SHORT_SHA="${GITHUB_SHA::7}"
           SOURCE_REF="${GITHUB_REF_NAME:-unknown}"
-          SOURCE_COMMIT_MESSAGE="$(git -C "$GITHUB_WORKSPACE" log -1 --pretty=%B "$GITHUB_SHA")"
-          SOURCE_COMMIT_SUBJECT="$(printf '%s\n' "$SOURCE_COMMIT_MESSAGE" | sed -n '1p')"
-          if printf '%s\n' "$SOURCE_COMMIT_SUBJECT" | grep -q '^Merge pull request #'; then
-            MERGE_PR_TITLE="$(printf '%s\n' "$SOURCE_COMMIT_MESSAGE" | awk 'NF { count += 1; if (count == 2) { print; exit } }')"
-            if [ -n "$MERGE_PR_TITLE" ]; then
-              SOURCE_COMMIT_SUBJECT="$MERGE_PR_TITLE"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SOURCE_COMMIT_SUBJECT="build: ${{ steps.tasks.outputs.selected_extensions }} 수동 배포"
+          else
+            SOURCE_COMMIT_MESSAGE="$(git -C "$GITHUB_WORKSPACE" log -1 --pretty=%B "$GITHUB_SHA")"
+            SOURCE_COMMIT_SUBJECT="$(printf '%s\n' "$SOURCE_COMMIT_MESSAGE" | sed -n '1p')"
+            if printf '%s\n' "$SOURCE_COMMIT_SUBJECT" | grep -q '^Merge pull request #'; then
+              MERGE_PR_TITLE="$(printf '%s\n' "$SOURCE_COMMIT_MESSAGE" | awk 'NF { count += 1; if (count == 2) { print; exit } }')"
+              if [ -n "$MERGE_PR_TITLE" ]; then
+                SOURCE_COMMIT_SUBJECT="$MERGE_PR_TITLE"
+              fi
             fi
           fi
           if [ -z "$SOURCE_COMMIT_SUBJECT" ]; then
