@@ -100,7 +100,7 @@ open class Wolf(
     private fun parseBrowsePage(response: Response) {
         val document = response.asJsoup()
 
-        browseCache = document.select("a.t-card[href*=list]").mapNotNull {
+        browseCache = document.select("a.t-card[href*=$entryPath]").mapNotNull {
             val id = it.absUrl("href").toHttpUrl()
                 .queryParameter("toon")?.toIntOrNull()
                 ?: return@mapNotNull null
@@ -135,7 +135,7 @@ open class Wolf(
             .asObservableSuccess()
             .map { response ->
                 val document = Jsoup.parseBodyFragment(response.body.string(), searchUrl)
-                val entries = document.select("a.t-card[href*=list]").mapNotNull { element ->
+                val entries = document.select("a.t-card[href*=$entryPath]").mapNotNull { element ->
                     val mangaUrl = element.absUrl("href").toHttpUrl()
                     val id = mangaUrl.queryParameter("toon") ?: return@mapNotNull null
                     val title = element.selectFirst(".t-title")?.text()?.trim() ?: return@mapNotNull null
