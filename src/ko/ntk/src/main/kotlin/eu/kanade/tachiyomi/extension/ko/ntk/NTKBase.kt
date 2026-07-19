@@ -925,19 +925,11 @@ abstract class NTKBase(
             ?: issueNvCookie(referer)
 
         val data = try {
-            try {
-                fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
-            } catch (error: AdAcknowledgmentRequiredException) {
-                val acknowledgedHtml = loadChapterHtmlWithWebView(
-                    response.request,
-                    waitForAdAcknowledgment = true,
-                ) ?: throw error
-                val refreshedToken = extractHtmlString(acknowledgedHtml, "imagesToken") ?: throw error
-                val refreshedNvCookie = issueNvCookie(referer)
-                fetchPageImages(workId, episodeId, refreshedToken, refreshedNvCookie, referer)
-            }
+            fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
+        } catch (_: AdAcknowledgmentRequiredException) {
+            fetchPageImagesWithWebView(referer)
         } catch (error: ImageApiRequestException) {
-            if (error.code != HTTP_PRECONDITION_REQUIRED) throw error
+            if (!shouldUseWebViewForImageApi(error.code)) throw error
             fetchPageImagesWithWebView(referer)
         }
         return data.images.sortedWith(compareBy<PageImage> { it.page ?: Int.MAX_VALUE }.thenBy { it.src })
@@ -1013,7 +1005,7 @@ abstract class NTKBase(
         responseBody: String,
         referer: String,
     ): PageImagesResponse {
-        if (responseBody.contains("ad acknowledgment required", ignoreCase = true)) {
+        if (isAdAcknowledgmentRequiredResponse(responseBody)) {
             throw AdAcknowledgmentRequiredException("NTK image API requires ad acknowledgment for $referer")
         }
         if (!isSuccessful) {
@@ -1028,6 +1020,15 @@ abstract class NTKBase(
             throw Exception("NTK image API failed: invalid image JSON for $referer: ${responseBody.take(500)}", error)
         }
     }
+
+    private fun isAdAcknowledgmentRequiredResponse(responseBody: String): Boolean {
+        val normalizedBody = responseBody.lowercase(Locale.US)
+        return "ad acknowledgment required" in normalizedBody ||
+            "\"error\":\"ad_" in normalizedBody ||
+            "\"error\": \"ad_" in normalizedBody
+    }
+
+    private fun shouldUseWebViewForImageApi(code: Int): Boolean = code == HTTP_FORBIDDEN || code == HTTP_PRECONDITION_REQUIRED
 
     private fun fetchPageImagesWithWebView(referer: String): PageImagesResponse {
         val request = GET(
@@ -1227,6 +1228,7 @@ abstract class NTKBase(
         private val CLOUDFLARE_ERROR_CODES = listOf(403, 503)
         private const val WEBVIEW_HTML_FALLBACK_HEADER = "X-WebView-Html-Fallback"
         private const val WEBVIEW_IMAGE_FALLBACK_HEADER = "X-WebView-Intercept"
+        private const val HTTP_FORBIDDEN = 403
         private const val HTTP_PRECONDITION_REQUIRED = 428
         private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         private const val PREF_DOMAIN_KEY = "pref_domain_key"
