@@ -51,6 +51,11 @@ import javax.crypto.spec.SecretKeySpec
 
 private class AdAcknowledgmentRequiredException(message: String) : IOException(message)
 
+private class ImageApiRequestException(
+    val code: Int,
+    message: String,
+) : IOException(message)
+
 abstract class NTKBase(
     override val name: String,
     protected val contentKind: String,
@@ -672,6 +677,18 @@ abstract class NTKBase(
     )
 
     @Serializable
+    private data class Episode(
+        val sourceEpisodeId: String,
+        val title: String,
+        val epNo: Int? = null,
+    )
+
+    @Serializable
+    private data class EpisodesResponse(
+        val episodes: List<Episode>,
+    )
+
+    @Serializable
     private data class ImageApiRequest(
         val workId: String,
         val episodeId: String,
@@ -797,13 +814,93 @@ abstract class NTKBase(
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
-        return document.select("a.ep-row-v2-link[href]").map { element ->
+        val initialChapters = document.select("a.ep-row-v2-link[href]").map { element ->
             SChapter.create().apply {
                 setUrlWithoutDomain(element.attr("href"))
                 name = element.select(".ep-row-v2-title strong, .ep-row-v2-title").text()
                 date_upload = dateFormat.tryParse(element.select(".ep-row-v2-date").text())
             }
         }
+
+        val totalEpisodes = document.selectFirst(".ep-section-count")?.text()
+            ?.filter(Char::isDigit)
+            ?.toIntOrNull()
+            ?: return initialChapters
+        if (initialChapters.size >= totalEpisodes || initialChapters.isEmpty()) return initialChapters
+
+        val mangaPath = initialChapters.first().url.substringBeforeLast('/')
+        val workId = mangaPath.substringAfterLast('/')
+        val episodes = fetchAllEpisodes(workId, initialChapters.first().url)
+        if (episodes.size <= initialChapters.size) return initialChapters
+
+        val initialByUrl = initialChapters.associateBy { it.url }
+        return episodes.map { episode ->
+            val url = "$mangaPath/${episode.sourceEpisodeId}"
+            initialByUrl[url] ?: SChapter.create().apply {
+                this.url = url
+                name = if (contentKind == "webtoon" && episode.epNo != null) {
+                    "${episode.epNo}화 ${episode.title}"
+                } else {
+                    episode.title
+                }
+            }
+        }
+    }
+
+    private fun fetchAllEpisodes(workId: String, chapterUrl: String): List<Episode> {
+        val apiEpisodes = runCatching {
+            client.newCall(GET("$rootUrl/api/$contentKind/$workId/episodes", apiHeaders)).execute().use { response ->
+                if (response.isSuccessful) {
+                    json.decodeFromString<EpisodesResponse>(response.body.string()).episodes
+                } else {
+                    emptyList()
+                }
+            }
+        }.getOrDefault(emptyList())
+        if (apiEpisodes.isNotEmpty()) return apiEpisodes
+
+        // 만화책은 상세 목록을 100회까지만 렌더링하지만, 뷰어 HTML에는 전체 회차 배열이 포함됩니다.
+        return runCatching {
+            client.newCall(GET(rootUrl + chapterUrl, headers)).execute().use { response ->
+                if (response.isSuccessful) parseAllEpisodes(response.body.string()) else emptyList()
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun parseAllEpisodes(html: String): List<Episode> {
+        val content = html
+            .replace("\\\\", "\\")
+            .replace("\\\"", "\"")
+            .replace("\\/", "/")
+        val marker = "\"allEpisodes\":"
+        val arrayStart = content.indexOf(marker).let { index ->
+            if (index < 0) return emptyList()
+            index + marker.length
+        }
+        val arrayEnd = findJsonArrayEnd(content, arrayStart) ?: return emptyList()
+
+        return runCatching {
+            json.decodeFromString<List<Episode>>(content.substring(arrayStart, arrayEnd))
+        }.getOrDefault(emptyList())
+    }
+
+    private fun findJsonArrayEnd(content: String, start: Int): Int? {
+        var depth = 0
+        var inString = false
+        var escaped = false
+
+        for (index in start until content.length) {
+            val character = content[index]
+            when (character) {
+                '\\' -> if (inString) escaped = !escaped
+                '"' -> if (!escaped) inString = !inString
+                '[' -> if (!inString) depth++
+                ']' -> if (!inString && --depth == 0) return index + 1
+                else -> Unit
+            }
+            if (character != '\\') escaped = false
+        }
+        return null
     }
 
     override fun pageListParse(response: Response): List<Page> {
@@ -828,15 +925,20 @@ abstract class NTKBase(
             ?: issueNvCookie(referer)
 
         val data = try {
-            fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
-        } catch (error: AdAcknowledgmentRequiredException) {
-            val acknowledgedHtml = loadChapterHtmlWithWebView(
-                response.request,
-                waitForAdAcknowledgment = true,
-            ) ?: throw error
-            val refreshedToken = extractHtmlString(acknowledgedHtml, "imagesToken") ?: throw error
-            val refreshedNvCookie = issueNvCookie(referer)
-            fetchPageImages(workId, episodeId, refreshedToken, refreshedNvCookie, referer)
+            try {
+                fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
+            } catch (error: AdAcknowledgmentRequiredException) {
+                val acknowledgedHtml = loadChapterHtmlWithWebView(
+                    response.request,
+                    waitForAdAcknowledgment = true,
+                ) ?: throw error
+                val refreshedToken = extractHtmlString(acknowledgedHtml, "imagesToken") ?: throw error
+                val refreshedNvCookie = issueNvCookie(referer)
+                fetchPageImages(workId, episodeId, refreshedToken, refreshedNvCookie, referer)
+            }
+        } catch (error: ImageApiRequestException) {
+            if (error.code != HTTP_PRECONDITION_REQUIRED) throw error
+            fetchPageImagesWithWebView(referer)
         }
         return data.images.sortedWith(compareBy<PageImage> { it.page ?: Int.MAX_VALUE }.thenBy { it.src })
             .mapIndexed { i, image ->
@@ -915,12 +1017,30 @@ abstract class NTKBase(
             throw AdAcknowledgmentRequiredException("NTK image API requires ad acknowledgment for $referer")
         }
         if (!isSuccessful) {
-            throw Exception("NTK image API failed: HTTP $code for $referer: ${responseBody.take(500)}")
+            throw ImageApiRequestException(
+                code,
+                "NTK image API failed: HTTP $code for $referer: ${responseBody.take(500)}",
+            )
         }
         return runCatching {
             json.decodeFromString<PageImagesResponse>(responseBody)
         }.getOrElse { error ->
             throw Exception("NTK image API failed: invalid image JSON for $referer: ${responseBody.take(500)}", error)
+        }
+    }
+
+    private fun fetchPageImagesWithWebView(referer: String): PageImagesResponse {
+        val request = GET(
+            referer,
+            headers.newBuilder().add(WEBVIEW_IMAGE_FALLBACK_HEADER, "true").build(),
+        )
+        return client.newCall(request).execute().use { response ->
+            parseImageApiResponse(
+                response.code,
+                response.isSuccessful,
+                response.body.string(),
+                referer,
+            )
         }
     }
 
@@ -1106,6 +1226,8 @@ abstract class NTKBase(
         private val HTML_MEDIA_TYPE = "text/html; charset=utf-8".toMediaType()
         private val CLOUDFLARE_ERROR_CODES = listOf(403, 503)
         private const val WEBVIEW_HTML_FALLBACK_HEADER = "X-WebView-Html-Fallback"
+        private const val WEBVIEW_IMAGE_FALLBACK_HEADER = "X-WebView-Intercept"
+        private const val HTTP_PRECONDITION_REQUIRED = 428
         private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         private const val PREF_DOMAIN_KEY = "pref_domain_key"
         private const val PREF_DOMAIN_DEFAULT_KEY = "pref_domain_default_key"
