@@ -853,13 +853,7 @@ abstract class NTKBase(
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
-        val initialChapters = document.select("a.ep-row-v2-link[href]").map { element ->
-            SChapter.create().apply {
-                setUrlWithoutDomain(element.attr("href"))
-                name = element.select(".ep-row-v2-title strong, .ep-row-v2-title").text()
-                date_upload = dateFormat.tryParse(element.select(".ep-row-v2-date").text())
-            }
-        }
+        val initialChapters = parseChapterRows(document)
 
         val totalEpisodes = document.selectFirst(".ep-section-count")?.text()
             ?.filter(Char::isDigit)
@@ -869,24 +863,55 @@ abstract class NTKBase(
 
         val mangaPath = initialChapters.first().url.substringBeforeLast('/')
         val workId = mangaPath.substringAfterLast('/')
-        val episodes = fetchAllEpisodes(workId, initialChapters.first().url)
-        if (episodes.size <= initialChapters.size) return initialChapters
-
-        val initialByUrl = initialChapters.associateBy { it.url }
-        return episodes.map { episode ->
-            val url = "$mangaPath/${episode.sourceEpisodeId}"
-            initialByUrl[url] ?: SChapter.create().apply {
-                this.url = url
-                name = if (contentKind == "webtoon" && episode.epNo != null) {
-                    "${episode.epNo}화 ${episode.title}"
-                } else {
-                    episode.title
+        val episodes = fetchAllEpisodes(workId)
+        if (episodes.size > initialChapters.size) {
+            val initialByUrl = initialChapters.associateBy { it.url }
+            return episodes.map { episode ->
+                val url = "$mangaPath/${episode.sourceEpisodeId}"
+                initialByUrl[url] ?: SChapter.create().apply {
+                    this.url = url
+                    name = if (contentKind == "webtoon" && episode.epNo != null) {
+                        "${episode.epNo}화 ${episode.title}"
+                    } else {
+                        episode.title
+                    }
                 }
             }
         }
+
+        return fetchAllChapterPages(mangaPath, totalEpisodes, initialChapters)
+            .takeIf { it.size > initialChapters.size }
+            ?: initialChapters
     }
 
-    private fun fetchAllEpisodes(workId: String, chapterUrl: String): List<Episode> {
+    private fun parseChapterRows(document: org.jsoup.nodes.Document): List<SChapter> = document.select("a.ep-row-v2-link[href]").map { element ->
+        SChapter.create().apply {
+            setUrlWithoutDomain(element.attr("href"))
+            name = element.select(".ep-row-v2-title strong, .ep-row-v2-title").text()
+            date_upload = dateFormat.tryParse(element.select(".ep-row-v2-date").text())
+        }
+    }
+
+    private fun fetchAllChapterPages(
+        mangaPath: String,
+        totalEpisodes: Int,
+        initialChapters: List<SChapter>,
+    ): List<SChapter> {
+        val chapters = initialChapters.toMutableList()
+        val totalPages = (totalEpisodes + EPISODES_PER_PAGE - 1) / EPISODES_PER_PAGE
+        for (page in 2..totalPages) {
+            val pageChapters = runCatching {
+                client.newCall(GET("$rootUrl$mangaPath?epage=$page", headers)).execute().use { response ->
+                    if (response.isSuccessful) parseChapterRows(response.asJsoup()) else emptyList()
+                }
+            }.getOrDefault(emptyList())
+            if (pageChapters.isEmpty()) break
+            chapters += pageChapters
+        }
+        return chapters.distinctBy { it.url }
+    }
+
+    private fun fetchAllEpisodes(workId: String): List<Episode> {
         val apiEpisodes = runCatching {
             client.newCall(GET("$rootUrl/api/$contentKind/$workId/episodes", apiHeaders)).execute().use { response ->
                 if (response.isSuccessful) {
@@ -898,48 +923,7 @@ abstract class NTKBase(
         }.getOrDefault(emptyList())
         if (apiEpisodes.isNotEmpty()) return apiEpisodes
 
-        // 만화책은 상세 목록을 100회까지만 렌더링하지만, 뷰어 HTML에는 전체 회차 배열이 포함됩니다.
-        return runCatching {
-            client.newCall(GET(rootUrl + chapterUrl, headers)).execute().use { response ->
-                if (response.isSuccessful) parseAllEpisodes(response.body.string()) else emptyList()
-            }
-        }.getOrDefault(emptyList())
-    }
-
-    private fun parseAllEpisodes(html: String): List<Episode> {
-        val content = html
-            .replace("\\\\", "\\")
-            .replace("\\\"", "\"")
-            .replace("\\/", "/")
-        val marker = "\"allEpisodes\":"
-        val arrayStart = content.indexOf(marker).let { index ->
-            if (index < 0) return emptyList()
-            index + marker.length
-        }
-        val arrayEnd = findJsonArrayEnd(content, arrayStart) ?: return emptyList()
-
-        return runCatching {
-            json.decodeFromString<List<Episode>>(content.substring(arrayStart, arrayEnd))
-        }.getOrDefault(emptyList())
-    }
-
-    private fun findJsonArrayEnd(content: String, start: Int): Int? {
-        var depth = 0
-        var inString = false
-        var escaped = false
-
-        for (index in start until content.length) {
-            val character = content[index]
-            when (character) {
-                '\\' -> if (inString) escaped = !escaped
-                '"' -> if (!escaped) inString = !inString
-                '[' -> if (!inString) depth++
-                ']' -> if (!inString && --depth == 0) return index + 1
-                else -> Unit
-            }
-            if (character != '\\') escaped = false
-        }
-        return null
+        return emptyList()
     }
 
     override fun pageListParse(response: Response): List<Page> {
@@ -1575,6 +1559,7 @@ abstract class NTKBase(
         private const val PREF_DOMAIN_DEFAULT_KEY = "pref_domain_default_key"
         private const val PREVIOUS_DOMAIN_DEFAULT = "3"
         private const val PREF_DOMAIN_DEFAULT = "9"
+        private const val EPISODES_PER_PAGE = 100
         const val PAGE_SIZE = 49
     }
 }
