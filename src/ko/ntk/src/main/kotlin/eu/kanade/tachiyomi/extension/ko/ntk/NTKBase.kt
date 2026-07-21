@@ -6,8 +6,6 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.webkit.JavascriptInterface
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -28,6 +26,8 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -49,7 +49,6 @@ import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -86,11 +85,13 @@ abstract class NTKBase(
     override val supportsLatest = true
     protected val preferences by getPreferencesLazy()
     private val clientSigningKey = AtomicReference<ClientSigningKey?>(null)
+    private val fingerprintValue = AtomicReference<String?>(null)
+    private val adAcknowledgmentCookie = AtomicReference<String?>(null)
 
     protected val rootUrl: String
         get() {
             val stored = preferences.getString(PREF_DOMAIN_KEY, null)
-            val normalizedStored = stored?.trim()?.trimStart('0')?.ifEmpty { "0" }
+            val normalizedStored = normalizeDomainNumber(stored)
             val previousDefault = preferences.getString(PREF_DOMAIN_DEFAULT_KEY, null)
             val domainNumber = when {
                 normalizedStored == null -> PREF_DOMAIN_DEFAULT
@@ -113,110 +114,48 @@ abstract class NTKBase(
     override fun mangaDetailsRequest(manga: SManga) = GET(rootUrl + manga.url, headers)
     override fun chapterListRequest(manga: SManga) = GET(rootUrl + manga.url, headers)
 
-    override fun pageListRequest(chapter: SChapter) = GET(
+    override fun pageListRequest(chapter: SChapter): Request = GET(
         rootUrl + chapter.url,
-        headers.newBuilder().add(WEBVIEW_HTML_FALLBACK_HEADER, "true").build(),
+        if (contentKind == "manhwa") {
+            headers
+        } else {
+            headers.newBuilder().add(WEBVIEW_HTML_FALLBACK_HEADER, "true").build()
+        },
     )
 
     private val imageBridgeScript = """
         (function() {
-            function sendPayloadText(text) {
+            if (window.__ntkImageCapture) return;
+            window.__ntkImageCapture = true;
+            window.__ntkDone = false;
+
+            function signalAdAcknowledgment() {
+                const scope = window.location.pathname;
+                window.__ntk_ad_ack_scope = scope;
                 try {
-                    const payload = JSON.parse(text);
+                    window.dispatchEvent(new CustomEvent("ntk-ad-ack-ready", { detail: { scope: scope } }));
+                } catch (_) {}
+            }
+
+            function send(value) {
+                if (window.__ntkDone) return;
+                try {
+                    const payload = typeof value === "string" ? JSON.parse(value) : value;
+                    if (payload && (
+                        payload.error === "ad_ack_required" ||
+                        payload.error === "fingerprint_required" ||
+                        payload.error === "browser_key_required"
+                    )) {
+                        signalAdAcknowledgment();
+                        return;
+                    }
                     if (payload && Array.isArray(payload.images) && payload.images.length > 0) {
+                        window.__ntkDone = true;
                         window.TrojanTunnel.exfiltrateApi(JSON.stringify(payload));
                     }
                 } catch (_) {
-                    // Ignore non-image API responses.
+                    // Ignore unrelated responses.
                 }
-            }
-
-            function absoluteUrl(src) {
-                try {
-                    return new URL(src, window.location.href).href;
-                } catch (_) {
-                    return src;
-                }
-            }
-
-            function imageSrc(img) {
-                const srcset = img.getAttribute("srcset") || img.getAttribute("data-srcset") || "";
-                const firstSrcset = srcset.split(",").map(item => item.trim().split(/\s+/)[0]).find(Boolean);
-                return img.currentSrc ||
-                    img.src ||
-                    img.getAttribute("data-src") ||
-                    img.getAttribute("data-original") ||
-                    img.getAttribute("data-lazy-src") ||
-                    img.getAttribute("data-url") ||
-                    firstSrcset ||
-                    img.getAttribute("src");
-            }
-
-            function isPageAlt(img) {
-                return /^page\s*\d+$/i.test((img.getAttribute("alt") || "").trim());
-            }
-
-            function isBadImage(img, src) {
-                const meta = [
-                    src,
-                    img.getAttribute("alt"),
-                    img.getAttribute("class"),
-                    img.getAttribute("id"),
-                    img.closest("a") && img.closest("a").href,
-                ].filter(Boolean).join(" ").toLowerCase();
-
-                if (!src || /^(data|blob):/i.test(src)) return true;
-                if (/\.(svg|ico)(\?|#|$)/i.test(src)) return true;
-                if (/(logo|icon|avatar|profile|thumb|thumbnail|placeholder|comment|emoji|emoticon|platform)/i.test(meta)) return true;
-
-                if (isPageAlt(img)) return false;
-
-                // 광고 배너는 대체로 매우 넓고 낮거나, 외부 도박/배너 키워드를 포함합니다.
-                if (/(banner|advert|\bad\b|casino|bet|slot|sports|telegram|register|code=|agentcode|referral)/i.test(meta)) return true;
-
-                const width = img.naturalWidth || img.width || img.clientWidth || 0;
-                const height = img.naturalHeight || img.height || img.clientHeight || 0;
-                if (width > 0 && height > 0) {
-                    if (width < 240 || height < 240) return true;
-                    if (width / Math.max(height, 1) > 3.2) return true;
-                }
-
-                return false;
-            }
-
-            function uniqueImages(srcs) {
-                const seen = new Set();
-                return srcs
-                    .filter(Boolean)
-                    .map(absoluteUrl)
-                    .filter(src => {
-                        if (!src || seen.has(src)) return false;
-                        seen.add(src);
-                        return true;
-                    });
-            }
-
-            function rememberImages(srcs) {
-                const images = uniqueImages(srcs);
-                const current = window.__ntkBestImages || [];
-                const merged = uniqueImages(current.concat(images));
-                if (merged.length >= current.length) {
-                    window.__ntkBestImages = merged;
-                }
-                sendCandidateImages(images);
-                return window.__ntkBestImages || [];
-            }
-
-            function sendCandidateImages(srcs) {
-                const images = uniqueImages(srcs);
-                if (images.length > 0) {
-                    window.TrojanTunnel.collectImages(JSON.stringify(images));
-                }
-            }
-
-            function emitBestImages() {
-                const images = window.__ntkBestImages || [];
-                sendCandidateImages(images);
             }
 
             function requestUrl(input) {
@@ -227,110 +166,93 @@ abstract class NTKBase(
             }
 
             function shouldCapture(url) {
-                return /\/api\/[^?#]*(image|page|chapter|episode)/i.test(url || "");
+                try {
+                    const parsed = new URL(url || "", window.location.href);
+                    return parsed.origin === window.location.origin &&
+                        /\/api\/(webtoon|manhwa)-images$/i.test(parsed.pathname);
+                } catch (_) {
+                    return false;
+                }
             }
 
-            window.__ntkCollectPageImages = function() {
-                const allImages = Array.from(document.querySelectorAll("img"));
-                const pageAltImages = allImages
-                    .filter(isPageAlt)
-                    .map(imageSrc);
-
-                if (pageAltImages.length > 0) {
-                    rememberImages(pageAltImages);
+            function absoluteImageUrl(value) {
+                if (!value || /^(data|blob):/i.test(value)) return "";
+                try {
+                    const parsed = new URL(value, window.location.href);
+                    return /^(https?):$/i.test(parsed.protocol) ? parsed.href : "";
+                } catch (_) {
+                    return "";
                 }
+            }
 
-                const selectors = [
-                    "main img",
-                    "article img",
-                    ".viewer img",
-                    ".episode-viewer img",
-                    "[class*='viewer'] img",
-                    "[class*='episode'] img",
-                    "[class*='chapter'] img",
-                    "img[data-src]",
-                    "img[data-original]",
-                    "img[src*='http']",
-                ];
-
-                const candidates = Array.from(document.querySelectorAll(selectors.join(",")))
-                    .filter(img => !isBadImage(img, imageSrc(img)))
-                    .map(imageSrc);
-
-                rememberImages(candidates);
-            };
-
-            window.__ntkScrollAndCollect = function() {
-                const maxY = Math.max(
-                    document.documentElement.scrollHeight || 0,
-                    document.body && document.body.scrollHeight || 0,
-                );
-                const step = Math.max(Math.floor((window.innerHeight || 900) * 0.85), 600);
-                let y = window.scrollY || 0;
-
-                window.__ntkCollectPageImages();
-                const timer = window.setInterval(function() {
-                    y = Math.min(y + step, maxY);
-                    window.scrollTo(0, y);
-                    window.__ntkCollectPageImages();
-                    if (y >= maxY) {
-                        window.clearInterval(timer);
-                        window.setTimeout(window.__ntkCollectPageImages, 400);
-                    }
-                }, 450);
-            };
-
-            if (!window.__ntkImageBridgeInstalled) {
-                window.__ntkImageBridgeInstalled = true;
-                window.__ntkBestImages = [];
-
-                if (window.fetch) {
-                    const originalFetch = window.fetch.bind(window);
-                    window.fetch = async function() {
-                        const response = await originalFetch.apply(window, arguments);
-                        const url = requestUrl(arguments[0]);
-                        if (shouldCapture(url)) {
-                            response.clone().text().then(sendPayloadText).catch(function() {});
+            if (window.fetch) {
+                const originalFetch = window.fetch.bind(window);
+                window.fetch = function() {
+                    const args = arguments;
+                    return originalFetch.apply(window, args).then(function(response) {
+                        const method = (args[1] && args[1].method) ||
+                            (args[0] && args[0].method) || "GET";
+                        if (response.ok && String(method).toUpperCase() === "POST" && shouldCapture(requestUrl(args[0]))) {
+                            response.clone().text().then(send).catch(function() {});
                         }
                         return response;
-                    };
+                    });
+                };
+            }
+
+            if (window.XMLHttpRequest) {
+                const originalOpen = XMLHttpRequest.prototype.open;
+                const originalSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__ntkImageUrl = requestUrl(url);
+                    return originalOpen.apply(this, arguments);
+                };
+                XMLHttpRequest.prototype.send = function() {
+                    this.addEventListener("load", function() {
+                        if (shouldCapture(this.__ntkImageUrl)) send(this.responseText || "");
+                    });
+                    return originalSend.apply(this, arguments);
+                };
+            }
+
+            let checks = 0;
+            const timer = window.setInterval(function() {
+                if (window.__ntkDone) {
+                    window.clearInterval(timer);
+                    return;
                 }
 
-                if (window.XMLHttpRequest) {
-                    const originalOpen = XMLHttpRequest.prototype.open;
-                    const originalSend = XMLHttpRequest.prototype.send;
-                    XMLHttpRequest.prototype.open = function(method, url) {
-                        this.__ntkUrl = requestUrl(url);
-                        return originalOpen.apply(this, arguments);
-                    };
-                    XMLHttpRequest.prototype.send = function() {
-                        this.addEventListener("load", function() {
-                            if (shouldCapture(this.__ntkUrl)) {
-                                sendPayloadText(this.responseText || "");
-                            }
+                const container = document.querySelector(".vw-imgs");
+                if (container) {
+                    const nodes = Array.from(container.querySelectorAll("img.viewer-ratio-img, img.viewer-lazy-img"));
+                    const expectedCount = parseInt(container.getAttribute("data-viewer-image-count") || "0", 10) || nodes.length;
+                    const seen = new Set();
+                    const images = nodes
+                        .map(function(img, index) {
+                            const src = absoluteImageUrl(
+                                img.currentSrc || img.getAttribute("src") || img.getAttribute("data-src") || "",
+                            );
+                            const pageMatch = (img.getAttribute("alt") || "").match(/\d+/);
+                            return src ? {
+                                src: src,
+                                page: pageMatch ? parseInt(pageMatch[0], 10) : index + 1,
+                            } : null;
+                        })
+                        .filter(function(image) {
+                            if (!image || seen.has(image.src)) return false;
+                            seen.add(image.src);
+                            return true;
                         });
-                        return originalSend.apply(this, arguments);
-                    };
+
+                    if (images.length > 0 && (!expectedCount || images.length >= expectedCount)) {
+                        window.clearInterval(timer);
+                        send({ images: images });
+                    }
                 }
-            }
 
-            [0, 500, 1200, 2500, 4500, 7000, 10000, 14000].forEach(delay => {
-                window.setTimeout(window.__ntkCollectPageImages, delay);
-            });
-            window.setTimeout(emitBestImages, 15000);
-        })();
-    """.trimIndent()
-
-    private val imageBridgeCollectScript = """
-        (function() {
-            if (window.__ntkCollectPageImages) {
-                window.__ntkCollectPageImages();
-                window.setTimeout(window.__ntkCollectPageImages, 500);
-                window.setTimeout(window.__ntkCollectPageImages, 1500);
-            }
-            if (window.__ntkScrollAndCollect) {
-                window.setTimeout(window.__ntkScrollAndCollect, 800);
-            }
+                checks += 1;
+                if (checks > 200) window.clearInterval(timer);
+            }, 100);
         })();
     """.trimIndent()
 
@@ -370,159 +292,7 @@ abstract class NTKBase(
             return@Interceptor chain.proceed(request)
         }
 
-        val finalPayload = AtomicReference<String?>(null)
-        val isComplete = AtomicBoolean(false)
-        val capturedImageUrls = CopyOnWriteArrayList<String>()
-        val latch = CountDownLatch(1)
-        val handler = Handler(Looper.getMainLooper())
-
-        fun imageListPayload(urls: List<String>): String {
-            val images = urls.distinct().joinToString(",") { url ->
-                "{\"src\":${json.encodeToString(url)}}"
-            }
-            return "{\"images\":[$images]}"
-        }
-
-        fun completeWith(payload: String) {
-            if (payload.isNotBlank() && isComplete.compareAndSet(false, true)) {
-                finalPayload.set(payload)
-                latch.countDown()
-            }
-        }
-
-        fun isBlockedImageUrl(url: String): Boolean {
-            val lower = url.lowercase(Locale.US)
-            if (lower.startsWith("data:") || lower.startsWith("blob:")) return true
-            if (
-                "logo" in lower || "icon" in lower || "avatar" in lower || "profile" in lower ||
-                "thumb" in lower || "thumbnail" in lower
-            ) {
-                return true
-            }
-            if (
-                "banner" in lower || "advert" in lower || "casino" in lower || "bet" in lower ||
-                "telegram" in lower || "agentcode" in lower || "referral" in lower
-            ) {
-                return true
-            }
-            return false
-        }
-
-        fun shouldKeepCapturedImage(url: String, accept: String = ""): Boolean {
-            if (isBlockedImageUrl(url)) return false
-            val lower = url.lowercase(Locale.US)
-            if (accept.lowercase(Locale.US).contains("image")) return true
-            if ("toonflix.app" in lower || "11toon" in lower) return true
-            return lower.contains("image") ||
-                lower.contains("webtoon") ||
-                lower.contains("manhwa") ||
-                lower.contains("page") ||
-                lower.matches(Regex(".*\\.(jpg|jpeg|png|webp|avif)(\\?.*)?$"))
-        }
-
-        fun collectImageUrls(payload: String) {
-            if (payload.isBlank()) return
-            runCatching {
-                json.decodeFromString<List<String>>(payload)
-            }.getOrNull()?.forEach { url ->
-                if (shouldKeepCapturedImage(url)) {
-                    capturedImageUrls.addIfAbsent(url)
-                }
-            }
-        }
-
-        fun completeWithCapturedImages() {
-            if (!isComplete.get() && capturedImageUrls.isNotEmpty()) {
-                completeWith(imageListPayload(capturedImageUrls))
-            }
-        }
-
-        handler.post {
-            val context = Injekt.get<Application>()
-            val webView = WebView(context)
-
-            webView.settings.javaScriptEnabled = true
-            webView.settings.domStorageEnabled = true
-            webView.settings.loadsImagesAutomatically = true
-            webView.settings.blockNetworkImage = false
-            webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
-            webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-
-            webView.measure(
-                android.view.View.MeasureSpec.makeMeasureSpec(1080, android.view.View.MeasureSpec.EXACTLY),
-                android.view.View.MeasureSpec.makeMeasureSpec(1920, android.view.View.MeasureSpec.EXACTLY),
-            )
-            webView.layout(0, 0, 1080, 1920)
-
-            webView.settings.userAgentString = request.header("User-Agent")
-                ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-            android.webkit.CookieManager.getInstance().setAcceptCookie(true)
-            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-
-            webView.addJavascriptInterface(
-                object {
-                    @JavascriptInterface
-                    fun exfiltrateApi(html: String) {
-                        completeWith(html)
-                    }
-
-                    @JavascriptInterface
-                    fun collectImages(imagesJson: String) {
-                        collectImageUrls(imagesJson)
-                    }
-                },
-                "TrojanTunnel",
-            )
-
-            webView.webViewClient = object : WebViewClient() {
-                override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
-                    view.evaluateJavascript(imageBridgeScript, null)
-
-                    super.onPageStarted(view, url, favicon)
-                }
-
-                override fun onPageFinished(view: WebView, url: String) {
-                    view.evaluateJavascript(imageBridgeScript, null)
-                    view.evaluateJavascript(imageBridgeCollectScript, null)
-                    handler.postDelayed({ view.evaluateJavascript(imageBridgeCollectScript, null) }, 3_000)
-                    handler.postDelayed({ view.evaluateJavascript(imageBridgeCollectScript, null) }, 7_000)
-                    handler.postDelayed(
-                        {
-                            view.evaluateJavascript(
-                                "if (window.__ntkBestImages) window.TrojanTunnel.collectImages(JSON.stringify(window.__ntkBestImages));",
-                                null,
-                            )
-                        },
-                        18_000,
-                    )
-
-                    super.onPageFinished(view, url)
-                }
-
-                override fun shouldInterceptRequest(view: WebView, webRequest: WebResourceRequest): WebResourceResponse? {
-                    val imageUrl = webRequest.url?.toString().orEmpty()
-                    val accept = webRequest.requestHeaders?.get("Accept").orEmpty()
-                    if (shouldKeepCapturedImage(imageUrl, accept)) {
-                        capturedImageUrls.addIfAbsent(imageUrl)
-                    }
-                    return super.shouldInterceptRequest(view, webRequest)
-                }
-            }
-
-            webView.loadUrl(request.url.toString())
-
-            handler.postDelayed({ webView.evaluateJavascript(imageBridgeScript, null) }, 1_000)
-            handler.postDelayed({ webView.evaluateJavascript(imageBridgeCollectScript, null) }, 4_000)
-            handler.postDelayed({ webView.evaluateJavascript(imageBridgeCollectScript, null) }, 9_000)
-            handler.postDelayed({ completeWithCapturedImages() }, 23_000)
-        }
-
-        latch.await(28, TimeUnit.SECONDS)
-
-        completeWithCapturedImages()
-
-        finalPayload.get()?.let {
+        loadPageImagesPayloadWithWebView(request)?.let {
             val isJson = it.trim().startsWith("{")
             val mediaType = if (isJson) "application/json" else "text/html"
             return@Interceptor Response.Builder()
@@ -534,8 +304,106 @@ abstract class NTKBase(
                 .build()
         }
 
-        throw Exception("WebView timed out loading ${request.url}")
+        return@Interceptor chain.proceed(
+            request.newBuilder()
+                .removeHeader(WEBVIEW_IMAGE_FALLBACK_HEADER)
+                .build(),
+        )
     }
+
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
+    private fun loadPageImagesPayloadWithWebView(request: Request): String? {
+        val chapterUrl = request.url.toString()
+        val cookieManager = android.webkit.CookieManager.getInstance()
+        val attempts = listOf(
+            WebViewImageAttempt(rootUrl, chapterUrl),
+            WebViewImageAttempt(chapterUrl, chapterUrl, warmUpRoot = false),
+        )
+
+        attempts.forEach { attempt ->
+            val result = AtomicReference<String?>(null)
+            val completed = AtomicBoolean(false)
+            val latch = CountDownLatch(1)
+            val handler = Handler(Looper.getMainLooper())
+            val webViewRef = AtomicReference<WebView?>(null)
+
+            fun complete(payload: String) {
+                if (payload.isBlank() || completed.get()) return
+                val parsed = runCatching { json.decodeFromString<PageImagesResponse>(payload) }.getOrNull()
+                if (parsed?.images.isNullOrEmpty()) return
+                if (completed.compareAndSet(false, true)) {
+                    result.set(payload)
+                    cookieManager.flush()
+                    latch.countDown()
+                }
+            }
+
+            handler.post {
+                val webView = WebView(Injekt.get<Application>())
+                webViewRef.set(webView)
+                webView.settings.javaScriptEnabled = true
+                webView.settings.domStorageEnabled = true
+                webView.settings.loadsImagesAutomatically = true
+                webView.settings.blockNetworkImage = false
+                webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                webView.settings.userAgentString = request.header("User-Agent") ?: DEFAULT_USER_AGENT
+                webView.measure(
+                    android.view.View.MeasureSpec.makeMeasureSpec(360, android.view.View.MeasureSpec.EXACTLY),
+                    android.view.View.MeasureSpec.makeMeasureSpec(640, android.view.View.MeasureSpec.EXACTLY),
+                )
+                webView.layout(0, 0, 360, 640)
+
+                cookieManager.setAcceptCookie(true)
+                cookieManager.setAcceptThirdPartyCookies(webView, true)
+                webView.addJavascriptInterface(
+                    object {
+                        @JavascriptInterface
+                        fun exfiltrateApi(payload: String) = complete(payload)
+                    },
+                    "TrojanTunnel",
+                )
+
+                var chapterNavigationStarted = !attempt.warmUpRoot
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                        if (chapterNavigationStarted) view.evaluateJavascript(imageBridgeScript, null)
+                        super.onPageStarted(view, url, favicon)
+                    }
+
+                    override fun onPageFinished(view: WebView, url: String) {
+                        if (!chapterNavigationStarted) {
+                            chapterNavigationStarted = true
+                            handler.postDelayed({
+                                if (!completed.get()) view.loadUrl(attempt.chapterUrl)
+                            }, WEBVIEW_ROOT_WARMUP_DELAY_MS)
+                        }
+                        view.evaluateJavascript(imageBridgeScript, null)
+                        super.onPageFinished(view, url)
+                    }
+                }
+
+                webView.loadUrl(attempt.initialUrl)
+            }
+
+            latch.await(WEBVIEW_IMAGE_ATTEMPT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            handler.post {
+                webViewRef.getAndSet(null)?.run {
+                    stopLoading()
+                    destroy()
+                }
+            }
+            result.get()?.let { return it }
+        }
+
+        return null
+    }
+
+    private data class WebViewImageAttempt(
+        val initialUrl: String,
+        val chapterUrl: String,
+        val warmUpRoot: Boolean = true,
+    )
 
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
     private fun loadChapterHtmlWithWebView(
@@ -694,13 +562,17 @@ abstract class NTKBase(
 
     @Serializable
     private data class Episode(
-        val sourceEpisodeId: String,
-        val title: String,
+        val sourceEpisodeId: JsonPrimitive,
+        val title: String? = null,
         val epNo: Int? = null,
     )
 
     @Serializable
     private data class EpisodesResponse(
+        val ok: Boolean? = null,
+        val total: Int? = null,
+        val page: Int? = null,
+        val totalPages: Int? = null,
         val episodes: List<Episode>,
     )
 
@@ -715,10 +587,10 @@ abstract class NTKBase(
 
     @Serializable
     private data class ClientPublicKey(
-        val crv: String = "P-256",
-        val ext: Boolean = true,
-        @SerialName("key_ops") val keyOps: List<String> = listOf("verify"),
-        val kty: String = "EC",
+        val crv: String,
+        val ext: Boolean,
+        @SerialName("key_ops") val keyOps: List<String>,
+        val kty: String,
         val x: String,
         val y: String,
     )
@@ -736,9 +608,51 @@ abstract class NTKBase(
         val serverNow: Long? = null,
     )
 
+    @Serializable
+    private data class AdChallengeRequest(
+        val path: String,
+        val force: Boolean = true,
+    )
+
+    @Serializable
+    private data class AdChallengeResponse(
+        val ok: Boolean = false,
+        val temporary: Boolean = false,
+        val challenge: AdChallenge? = null,
+    )
+
+    @Serializable
+    private data class AdChallenge(
+        val token: String,
+        val scope: String,
+        val slotCount: Int,
+        val minSeen: Int,
+        val impressionUrls: List<String> = emptyList(),
+    )
+
+    @Serializable
+    private data class AdAcknowledgmentRequest(
+        val challengeToken: String,
+        val total: Int,
+        val visible: Int,
+        val path: String,
+        val td: Int = 0,
+        val tp: String = "0",
+        val ap: String = "0",
+        val requestKeyId: String,
+        val observationUrls: List<String>,
+    )
+
+    @Serializable
+    private data class AdAcknowledgmentResponse(
+        val ok: Boolean = false,
+    )
+
     protected fun htmlCardParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val mangas = document.select("div.card-grid > a.card").map { element ->
+        val cardSelector = listOf("div.card-grid", "div.search-results-grid")
+            .joinToString(", ") { "$it > a.card[href^=\"/$contentKind/\"]" }
+        val mangas = document.select(cardSelector).map { element ->
             SManga.create().apply {
                 setUrlWithoutDomain(element.absUrl("href"))
                 title = element.select("p.subject").text()
@@ -854,6 +768,18 @@ abstract class NTKBase(
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
         val initialChapters = parseChapterRows(document)
+        val mangaPath = response.request.url.encodedPath.trimEnd('/')
+        val workId = response.request.url.pathSegments.getOrNull(1)
+
+        if (workId != null) {
+            fetchAllEpisodes(workId)?.let { episodes ->
+                val apiChapters = episodesToChapters(mangaPath, episodes)
+                val expectedCount = document.selectFirst(".ep-section-count")?.text()
+                    ?.filter(Char::isDigit)
+                    ?.toIntOrNull()
+                if (expectedCount == null || apiChapters.size == expectedCount) return apiChapters
+            }
+        }
 
         val totalEpisodes = document.selectFirst(".ep-section-count")?.text()
             ?.filter(Char::isDigit)
@@ -861,34 +787,25 @@ abstract class NTKBase(
             ?: return initialChapters
         if (initialChapters.size >= totalEpisodes || initialChapters.isEmpty()) return initialChapters
 
-        val mangaPath = initialChapters.first().url.substringBeforeLast('/')
-        val workId = mangaPath.substringAfterLast('/')
-        val episodes = fetchAllEpisodes(workId)
-        if (episodes.size > initialChapters.size) {
-            val initialByUrl = initialChapters.associateBy { it.url }
-            return episodes.map { episode ->
-                val url = "$mangaPath/${episode.sourceEpisodeId}"
-                initialByUrl[url] ?: SChapter.create().apply {
-                    this.url = url
-                    name = if (contentKind == "webtoon" && episode.epNo != null) {
-                        "${episode.epNo}화 ${episode.title}"
-                    } else {
-                        episode.title
-                    }
-                }
-            }
-        }
-
         return fetchAllChapterPages(mangaPath, totalEpisodes, initialChapters)
             .takeIf { it.size > initialChapters.size }
             ?: initialChapters
     }
 
-    private fun parseChapterRows(document: org.jsoup.nodes.Document): List<SChapter> = document.select("a.ep-row-v2-link[href]").map { element ->
-        SChapter.create().apply {
-            setUrlWithoutDomain(element.attr("href"))
-            name = element.select(".ep-row-v2-title strong, .ep-row-v2-title").text()
-            date_upload = dateFormat.tryParse(element.select(".ep-row-v2-date").text())
+    private fun parseChapterRows(document: org.jsoup.nodes.Document): List<SChapter> = document.select("a.ep-row-v2-link[href]").mapNotNull { element ->
+        val href = element.attr("href").trim()
+        val title = (
+            element.selectFirst(".ep-row-v2-title strong")
+                ?: element.selectFirst(".ep-row-v2-title")
+            )?.text()?.trim().orEmpty()
+        if (href.isEmpty() || title.isEmpty()) {
+            null
+        } else {
+            SChapter.create().apply {
+                setUrlWithoutDomain(href)
+                name = title
+                date_upload = dateFormat.tryParse(element.select(".ep-row-v2-date").text())
+            }
         }
     }
 
@@ -900,30 +817,122 @@ abstract class NTKBase(
         val chapters = initialChapters.toMutableList()
         val totalPages = (totalEpisodes + EPISODES_PER_PAGE - 1) / EPISODES_PER_PAGE
         for (page in 2..totalPages) {
-            val pageChapters = runCatching {
-                client.newCall(GET("$rootUrl$mangaPath?epage=$page", headers)).execute().use { response ->
-                    if (response.isSuccessful) parseChapterRows(response.asJsoup()) else emptyList()
-                }
-            }.getOrDefault(emptyList())
+            val pageChapters = fetchChapterPage(mangaPath, page)
             if (pageChapters.isEmpty()) break
             chapters += pageChapters
         }
-        return chapters.distinctBy { it.url }
+        return chapters.distinctBy(SChapter::url).also {
+            if (it.size < totalEpisodes) {
+                throw IOException("NTK chapter list incomplete: expected $totalEpisodes, received ${it.size}")
+            }
+        }
     }
 
-    private fun fetchAllEpisodes(workId: String): List<Episode> {
-        val apiEpisodes = runCatching {
-            client.newCall(GET("$rootUrl/api/$contentKind/$workId/episodes", apiHeaders)).execute().use { response ->
-                if (response.isSuccessful) {
-                    json.decodeFromString<EpisodesResponse>(response.body.string()).episodes
-                } else {
-                    emptyList()
+    private fun fetchChapterPage(mangaPath: String, page: Int): List<SChapter> = runCatching {
+        client.newCall(GET("$rootUrl$mangaPath?epage=$page", headers)).execute().use { response ->
+            if (response.isSuccessful) parseChapterRows(response.asJsoup()) else emptyList()
+        }
+    }.getOrDefault(emptyList())
+
+    private fun fetchAllEpisodes(workId: String): List<Episode>? = runCatching {
+        if (contentKind == "manhwa") {
+            fetchAllManhwaEpisodes(workId)
+        } else {
+            val payload = fetchEpisodePage(workId)
+            if (payload.total == null) throw IOException("NTK episode API failed: missing total")
+            if (payload.total != payload.episodes.size) {
+                throw IOException("NTK episode API failed: expected ${payload.total}, received ${payload.episodes.size}")
+            }
+            payload.episodes
+        }
+    }.getOrNull()
+
+    private fun fetchAllManhwaEpisodes(workId: String): List<Episode> {
+        val firstPage = fetchEpisodePage(workId, page = 1)
+        val total = firstPage.total
+        if (total != null && total !in 0..(MAX_EPISODE_API_PAGES * EPISODES_PER_PAGE)) {
+            throw IOException("NTK episode API failed: invalid total")
+        }
+        val totalPages = firstPage.totalPages
+            ?: total?.let { (it + EPISODES_PER_PAGE - 1) / EPISODES_PER_PAGE }
+            ?: 1
+        if (totalPages !in 0..MAX_EPISODE_API_PAGES || (totalPages == 0 && firstPage.episodes.isNotEmpty())) {
+            throw IOException("NTK episode API failed: invalid total pages")
+        }
+
+        val episodes = ArrayList<Episode>(total ?: firstPage.episodes.size)
+        episodes += firstPage.episodes
+        for (page in 2..totalPages) {
+            val payload = fetchEpisodePage(workId, page)
+            if (payload.page != null && payload.page != page) {
+                throw IOException("NTK episode API failed: expected page $page, received ${payload.page}")
+            }
+            if (payload.total != null && total != null && payload.total != total) {
+                throw IOException("NTK episode API failed: total changed while paging")
+            }
+            if (payload.totalPages != null && payload.totalPages != totalPages) {
+                throw IOException("NTK episode API failed: total pages changed while paging")
+            }
+            episodes += payload.episodes
+        }
+        if (total != null && total != episodes.size) {
+            throw IOException("NTK episode API failed: expected $total, received ${episodes.size}")
+        }
+        return episodes
+    }
+
+    private fun fetchEpisodePage(workId: String, page: Int? = null): EpisodesResponse {
+        val url = rootUrl.toHttpUrl().newBuilder()
+            .addPathSegments("api/$contentKind")
+            .addPathSegment(workId)
+            .addPathSegment("episodes")
+            .apply {
+                if (contentKind == "manhwa") {
+                    addPathSegment("viewer-nav")
+                    addQueryParameter("page", (page ?: 1).toString())
                 }
             }
-        }.getOrDefault(emptyList())
-        if (apiEpisodes.isNotEmpty()) return apiEpisodes
+            .build()
+        return client.newCall(GET(url, apiHeaders)).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("NTK episode API failed: HTTP ${response.code}")
+            val payload = json.decodeFromString<EpisodesResponse>(response.body.string())
+            if (payload.ok != true) throw IOException("NTK episode API failed: invalid response")
+            payload
+        }
+    }
 
-        return emptyList()
+    private fun episodesToChapters(mangaPath: String, episodes: List<Episode>): List<SChapter> {
+        val seenIds = HashSet<String>(episodes.size)
+        return episodes.map { episode ->
+            val episodeId = episode.sourceEpisodeId.content.trim()
+            if (
+                episodeId.isEmpty() ||
+                episodeId == "." ||
+                episodeId == ".." ||
+                '/' in episodeId ||
+                '\\' in episodeId ||
+                '?' in episodeId ||
+                '#' in episodeId ||
+                episodeId.any { it.isISOControl() || it.isWhitespace() } ||
+                !seenIds.add(episodeId)
+            ) {
+                throw IOException("NTK episode API failed: invalid or duplicate episode id")
+            }
+
+            val title = episode.title?.trim().orEmpty().ifEmpty {
+                episode.epNo?.takeIf { contentKind == "webtoon" }?.let { "${it}화" }.orEmpty()
+            }
+            if (title.isEmpty()) throw IOException("NTK episode API failed: missing episode title")
+
+            SChapter.create().apply {
+                url = rootUrl.toHttpUrl().newBuilder()
+                    .addEncodedPathSegments(mangaPath.trim('/'))
+                    .addPathSegment(episodeId)
+                    .build()
+                    .encodedPath
+                name = title
+            }
+        }
     }
 
     override fun pageListParse(response: Response): List<Page> {
@@ -936,6 +945,12 @@ abstract class NTKBase(
             ?: throw Exception("NTK image API failed: missing episode id from $referer")
 
         val html = response.body.string()
+        runCatching {
+            json.decodeFromString<PageImagesResponse>(html)
+        }.getOrNull()?.takeIf { it.images.isNotEmpty() }?.let { webViewData ->
+            return webViewData.toPages(chapterUrl, referer)
+        }
+
         if (isCloudflareChallengeHtml(html)) {
             throw Exception("NTK image API failed: Cloudflare challenge page was returned for $referer")
         }
@@ -950,16 +965,34 @@ abstract class NTKBase(
         val data = try {
             fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
         } catch (_: AdAcknowledgmentRequiredException) {
-            fetchPageImagesAfterAdAcknowledgment(response.request, workId, episodeId, referer)
+            fetchPageImagesAfterAdAcknowledgment(
+                workId,
+                episodeId,
+                imagesToken,
+                nvCookie,
+                referer,
+            )
         } catch (error: ImageApiRequestException) {
             if (!shouldUseWebViewForImageApi(error.code)) throw error
             fetchPageImagesWithWebView(referer)
         }
-        return data.images.sortedWith(compareBy<PageImage> { it.page ?: Int.MAX_VALUE }.thenBy { it.src })
-            .mapIndexed { i, image ->
-                val imageUrl = chapterUrl.resolve(image.src)?.toString() ?: image.src
-                Page(i, referer, imageUrl)
+        return data.toPages(chapterUrl, referer)
+    }
+
+    private fun PageImagesResponse.toPages(chapterUrl: okhttp3.HttpUrl, referer: String): List<Page> {
+        val imageUrls = images
+            .sortedWith(compareBy<PageImage> { it.page ?: Int.MAX_VALUE }.thenBy { it.src })
+            .mapNotNull { image ->
+                chapterUrl.resolve(image.src.trim())
+                    ?.takeIf { it.scheme == "https" || it.scheme == "http" }
+                    ?.toString()
             }
+            .distinct()
+
+        if (imageUrls.isEmpty()) {
+            throw IOException("NTK image API returned no valid images for $referer")
+        }
+        return imageUrls.mapIndexed { index, imageUrl -> Page(index, referer, imageUrl) }
     }
 
     private fun fetchPageImages(
@@ -984,7 +1017,12 @@ abstract class NTKBase(
                 ),
             )
             val endpointPath = "/api/$contentKind-images"
-            val cookie = webViewCookieHeader(referer, "nv=$nvCookie")
+            val cookie = webViewCookieHeader(
+                referer,
+                "nv=$nvCookie",
+                fingerprintCookie(),
+                adAcknowledgmentCookie.get().orEmpty(),
+            )
             val signatureHeaders = createClientSignatureHeaders(
                 endpointPath,
                 Request.Builder().url(referer).build().url.encodedPath,
@@ -1065,20 +1103,16 @@ abstract class NTKBase(
     private fun shouldUseWebViewForImageApi(code: Int): Boolean = code == HTTP_FORBIDDEN || code == HTTP_PRECONDITION_REQUIRED
 
     private fun fetchPageImagesAfterAdAcknowledgment(
-        request: Request,
         workId: String,
         episodeId: String,
+        imagesToken: String,
+        nvCookie: String,
         referer: String,
     ): PageImagesResponse {
-        val acknowledgedHtml = loadChapterHtmlWithWebView(
-            request,
-            waitForAdAcknowledgment = true,
-        ) ?: return fetchPageImagesWithWebView(referer)
-        val token = extractHtmlString(acknowledgedHtml, "imagesToken") ?: return fetchPageImagesWithWebView(referer)
-        val nvCookie = issueNvCookie(referer)
+        if (!acknowledgeAds(referer)) return fetchPageImagesWithWebView(referer)
 
         return try {
-            fetchPageImages(workId, episodeId, token, nvCookie, referer)
+            fetchPageImages(workId, episodeId, imagesToken, nvCookie, referer)
         } catch (_: AdAcknowledgmentRequiredException) {
             fetchPageImagesWithWebView(referer)
         } catch (error: ImageApiRequestException) {
@@ -1086,6 +1120,89 @@ abstract class NTKBase(
             fetchPageImagesWithWebView(referer)
         }
     }
+
+    private fun acknowledgeAds(referer: String): Boolean = runCatching {
+        val refererUrl = Request.Builder().url(referer).build().url
+        val path = refererUrl.encodedPath
+        val cookie = webViewCookieHeader(referer, fingerprintCookie())
+        val signingKey = getClientSigningKey(referer, cookie) ?: return@runCatching false
+        val requestHeaders = headers.newBuilder()
+            .set("Accept", "application/json")
+            .set("Content-Type", "application/json")
+            .set("Origin", rootUrl)
+            .set("Referer", referer)
+            .apply { cookie?.let { set("Cookie", it) } }
+            .build()
+
+        val challengeBody = json.encodeToString(AdChallengeRequest(path))
+        val challenge = client.newCall(
+            Request.Builder()
+                .url("$rootUrl/api/ad/challenge")
+                .headers(requestHeaders)
+                .post(challengeBody.toRequestBody(JSON_MEDIA_TYPE))
+                .build(),
+        ).execute().use { response ->
+            if (!response.isSuccessful) return@runCatching false
+            json.decodeFromString<AdChallengeResponse>(response.body.string())
+        }
+        val adChallenge = challenge.challenge
+            ?.takeIf { challenge.ok && challenge.temporary && it.scope == path }
+            ?: return@runCatching false
+        val observationUrls = adChallenge.impressionUrls.take(adChallenge.minSeen.coerceAtLeast(1))
+        if (observationUrls.size < adChallenge.minSeen) return@runCatching false
+
+        observationUrls.forEach { observationUrl ->
+            val url = refererUrl.resolve(observationUrl) ?: return@runCatching false
+            val observed = client.newCall(
+                GET(
+                    url,
+                    headers.newBuilder()
+                        .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                        .set("Referer", referer)
+                        .apply { cookie?.let { set("Cookie", it) } }
+                        .build(),
+                ),
+            ).execute().use { it.isSuccessful }
+            if (!observed) return@runCatching false
+        }
+
+        val acknowledgmentBody = json.encodeToString(
+            AdAcknowledgmentRequest(
+                challengeToken = adChallenge.token,
+                total = adChallenge.slotCount,
+                visible = adChallenge.slotCount,
+                path = path,
+                requestKeyId = signingKey.keyId,
+                observationUrls = observationUrls,
+            ),
+        )
+        client.newCall(
+            Request.Builder()
+                .url("$rootUrl/api/ad/ack")
+                .headers(requestHeaders)
+                .post(acknowledgmentBody.toRequestBody(JSON_MEDIA_TYPE))
+                .build(),
+        ).execute().use { response ->
+            val acknowledgment = runCatching {
+                json.decodeFromString<AdAcknowledgmentResponse>(response.body.string())
+            }.getOrNull()
+            val adAckValue = extractCookieValue(response.headers("Set-Cookie"), "ad_ack")
+            if (!response.isSuccessful || acknowledgment?.ok != true || adAckValue == null) {
+                return@use false
+            }
+
+            val cookie = "ad_ack=$adAckValue"
+            adAcknowledgmentCookie.set(cookie)
+            android.webkit.CookieManager.getInstance().run {
+                setCookie(
+                    rootUrl,
+                    "$cookie; Path=/; Max-Age=$AD_ACK_MAX_AGE_SECONDS; HttpOnly; Secure; SameSite=Lax",
+                )
+                flush()
+            }
+            true
+        }
+    }.getOrDefault(false)
 
     private fun createClientSignatureHeaders(
         endpointPath: String,
@@ -1141,6 +1258,10 @@ abstract class NTKBase(
                 val requestBody = json.encodeToString(
                     ClientKeyRegistrationRequest(
                         ClientPublicKey(
+                            crv = "P-256",
+                            ext = true,
+                            keyOps = listOf("verify"),
+                            kty = "EC",
                             x = base64Url(unsignedCoordinate(publicKey.w.affineX.toByteArray())),
                             y = base64Url(unsignedCoordinate(publicKey.w.affineY.toByteArray())),
                         ),
@@ -1184,8 +1305,9 @@ abstract class NTKBase(
             .post(requestBody.toRequestBody(JSON_MEDIA_TYPE))
             .build()
         client.newCall(request).execute().use { response ->
+            val responseBody = response.body.string()
             if (!response.isSuccessful) return@use null
-            json.decodeFromString<ClientKeyRegistrationResponse>(response.body.string())
+            json.decodeFromString<ClientKeyRegistrationResponse>(responseBody)
         }
     }.getOrNull()
 
@@ -1425,24 +1547,23 @@ abstract class NTKBase(
     }
 
     private fun extractHtmlString(html: String, key: String): String? {
-        val escapedMarker = "\\\"$key\\\":\\\""
-        val escapedStart = html.indexOf(escapedMarker)
-        if (escapedStart >= 0) {
-            val valueStart = escapedStart + escapedMarker.length
-            val valueEnd = html.indexOf("\\\"", valueStart)
-            if (valueEnd > valueStart) return html.substring(valueStart, valueEnd)
-        }
+        val keyStart = html.indexOf(key).takeIf { it >= 0 } ?: return null
+        val tail = html.substring(keyStart + key.length, minOf(html.length, keyStart + key.length + 4_096))
+            .replace("\\u0022", "\"")
+        val separator = tail.indexOf(':').takeIf { it >= 0 } ?: return null
+        val valueTail = tail.substring(separator + 1).trimStart()
 
-        val normalizedHtml = html.replace("\\u0022", "\"")
-        val marker = "\"$key\":\""
-        val start = normalizedHtml.indexOf(marker)
-        if (start >= 0) {
-            val valueStart = start + marker.length
-            val valueEnd = normalizedHtml.indexOf('"', valueStart)
-            if (valueEnd > valueStart) return normalizedHtml.substring(valueStart, valueEnd)
+        return when {
+            valueTail.startsWith("\\\"") -> {
+                val valueEnd = valueTail.indexOf("\\\"", startIndex = 2)
+                valueEnd.takeIf { it > 2 }?.let { valueTail.substring(2, it) }
+            }
+            valueTail.startsWith('"') -> {
+                val valueEnd = valueTail.indexOf('"', startIndex = 1)
+                valueEnd.takeIf { it > 1 }?.let { valueTail.substring(1, it) }
+            }
+            else -> null
         }
-
-        return null
     }
 
     private fun isCloudflareChallengeHtml(html: String): Boolean {
@@ -1473,6 +1594,37 @@ abstract class NTKBase(
 
         return cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
             .takeIf { it.isNotBlank() }
+    }
+
+    private fun fingerprintCookie(): String {
+        val cookieManager = android.webkit.CookieManager.getInstance()
+        val existing = cookieManager.getCookie(rootUrl)
+            ?.split(';')
+            ?.map(String::trim)
+            ?.firstOrNull { it.startsWith("ntk_fp=") }
+            ?.substringAfter('=')
+            ?.takeIf(FINGERPRINT_REGEX::matches)
+        val fingerprint = fingerprintValue.get() ?: existing ?: randomHex(FINGERPRINT_BYTES)
+        fingerprintValue.compareAndSet(null, fingerprint)
+        val cookie = "ntk_fp=${fingerprintValue.get() ?: fingerprint}"
+        cookieManager.setCookie(
+            rootUrl,
+            "$cookie; Path=/; Max-Age=$FINGERPRINT_MAX_AGE_SECONDS; SameSite=Lax; Secure",
+        )
+        cookieManager.flush()
+        return cookie
+    }
+
+    private fun randomHex(size: Int): String {
+        val bytes = ByteArray(size)
+        secureRandom.nextBytes(bytes)
+        return buildString(size * 2) {
+            bytes.forEach { byte ->
+                val value = byte.toInt() and 0xff
+                append(HEX_DIGITS[value ushr 4])
+                append(HEX_DIGITS[value and 0x0f])
+            }
+        }
     }
 
     private fun isCloudflareApiResponse(code: Int, body: String): Boolean {
@@ -1530,8 +1682,25 @@ abstract class NTKBase(
             title = "도메인 번호 (sbxh#.com)"
             summary = "현재 도메인 번호: ${preferences.getString(PREF_DOMAIN_KEY, PREF_DOMAIN_DEFAULT)}\n숫자만 입력하세요 (예: 1, 2, 300)"
             setDefaultValue(PREF_DOMAIN_DEFAULT)
+            setOnPreferenceChangeListener { preference, newValue ->
+                val domainNumber = normalizeDomainNumber(newValue as? String)
+                    ?: return@setOnPreferenceChangeListener false
+                preferences.edit()
+                    .putString(PREF_DOMAIN_KEY, domainNumber)
+                    .putString(PREF_DOMAIN_DEFAULT_KEY, PREF_DOMAIN_DEFAULT)
+                    .apply()
+                preference.summary = "현재 도메인 번호: $domainNumber\n숫자만 입력하세요 (예: 1, 2, 300)"
+                false
+            }
         }.also(screen::addPreference)
     }
+
+    private fun normalizeDomainNumber(value: String?): String? = value
+        ?.trim()
+        ?.takeIf(DOMAIN_NUMBER_REGEX::matches)
+        ?.trimStart('0')
+        ?.ifEmpty { "0" }
+        ?.takeUnless { it == "0" }
 
     companion object {
         private val json = Json { ignoreUnknownKeys = true }
@@ -1541,6 +1710,8 @@ abstract class NTKBase(
         private val CLOUDFLARE_HTML_ERROR_CODES = listOf(403, 503)
         private const val WEBVIEW_HTML_FALLBACK_HEADER = "X-WebView-Html-Fallback"
         private const val WEBVIEW_IMAGE_FALLBACK_HEADER = "X-WebView-Intercept"
+        private const val WEBVIEW_IMAGE_ATTEMPT_TIMEOUT_SECONDS = 20L
+        private const val WEBVIEW_ROOT_WARMUP_DELAY_MS = 3_000L
         private const val HTTP_FORBIDDEN = 403
         private const val HTTP_PRECONDITION_REQUIRED = 428
         private const val HTTP_SERVICE_UNAVAILABLE = 503
@@ -1554,12 +1725,19 @@ abstract class NTKBase(
         private val ASN1_SEQUENCE = 0x30.toByte()
         private val ASN1_INTEGER = 0x02.toByte()
         private val CLIENT_KEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
+        private val DOMAIN_NUMBER_REGEX = Regex("^\\d+$")
+        private val FINGERPRINT_REGEX = Regex("^[a-fA-F0-9]{16,}$")
+        private const val HEX_DIGITS = "0123456789abcdef"
+        private const val FINGERPRINT_BYTES = 16
+        private const val FINGERPRINT_MAX_AGE_SECONDS = 31_536_000
+        private const val AD_ACK_MAX_AGE_SECONDS = 300
         private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         private const val PREF_DOMAIN_KEY = "pref_domain_key"
         private const val PREF_DOMAIN_DEFAULT_KEY = "pref_domain_default_key"
         private const val PREVIOUS_DOMAIN_DEFAULT = "3"
         private const val PREF_DOMAIN_DEFAULT = "9"
         private const val EPISODES_PER_PAGE = 100
+        private const val MAX_EPISODE_API_PAGES = 1_000
         const val PAGE_SIZE = 49
     }
 }

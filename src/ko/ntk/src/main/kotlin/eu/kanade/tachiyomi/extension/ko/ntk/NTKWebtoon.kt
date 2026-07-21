@@ -39,7 +39,8 @@ class NTKWebtoon : NTKBase("NTK Webtoon", "webtoon") {
         if (query.isNotEmpty()) {
             val url = "$rootUrl/search".toHttpUrl().newBuilder().apply {
                 addQueryParameter("q", query)
-                addQueryParameter("kind", "webtoon")
+                addQueryParameter("field", "title")
+                addQueryParameter("match", "contains")
             }.build()
             return GET(url, headers)
         }
