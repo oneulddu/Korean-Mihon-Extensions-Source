@@ -28,7 +28,7 @@ class Toonkor :
 
     override val name = "Toonkor"
 
-    private val defaultBaseUrl = "https://tkor136.com"
+    private val defaultBaseUrl = "https://tkor137.com"
 
     private val baseUrlPref = "overrideBaseUrl_v${AppInfo.getVersionName()}"
 
@@ -173,7 +173,10 @@ class Toonkor :
     }
 
     companion object {
-        private val oldDefaultBaseUrls = setOf("https://tkor114.com")
+        private val oldDefaultBaseUrls = setOf(
+            "https://tkor114.com",
+            "https://tkor136.com",
+        )
 
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
         private const val BASE_URL_PREF_SUMMARY = "Override default domain with a different one"
