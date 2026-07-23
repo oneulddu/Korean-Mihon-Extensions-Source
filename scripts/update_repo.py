@@ -130,7 +130,7 @@ def infer_sources(module_dir: Path, ext_name: str, ext_lang: str) -> list[dict[s
     name_match = re.search(r"override\s+val\s+name(?:\s*:\s*String)?\s*=\s*['\"]([^'\"]+)['\"]", text)
     lang_match = re.search(r"override\s+val\s+lang(?:\s*:\s*String)?\s*=\s*['\"]([^'\"]+)['\"]", text)
     base_match = re.search(r"override\s+val\s+baseUrl(?:\s*:\s*String)?\s*=\s*['\"]([^'\"]+)['\"]", text)
-    default_base_match = re.search(r"defaultBaseUrl\s*=\s*['\"]([^'\"]+)['\"]", text)
+    fallback_base_match = re.search(r"(?:default|fallback)BaseUrl\s*=\s*['\"]([^'\"]+)['\"]", text)
     madara_match = re.search(r"Madara\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]", text, re.S)
     version_match = re.search(r"override\s+val\s+versionId\s*=\s*(\d+)", text)
 
@@ -139,7 +139,7 @@ def infer_sources(module_dir: Path, ext_name: str, ext_lang: str) -> list[dict[s
     else:
         name = name_match.group(1) if name_match else ext_name
         lang = lang_match.group(1) if lang_match else ext_lang
-        base_url = (base_match or default_base_match)
+        base_url = base_match or fallback_base_match
         if not base_url:
             raise SystemExit(f"Cannot infer baseUrl for {module_dir.name}; add it to scripts/extensions.json")
         base_url = base_url.group(1)

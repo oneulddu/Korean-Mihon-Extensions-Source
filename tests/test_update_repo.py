@@ -122,6 +122,39 @@ class UpdateRepoTest(unittest.TestCase):
             self.assertIn("[example.com](https://example.com)", updated)
             self.assertIn("`…ko.sample`", updated)
 
+    def test_infers_fallback_base_url_for_dynamic_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            source_dir = work_dir / "source"
+            deploy_dir = work_dir / "deploy"
+            deploy_dir.mkdir()
+            self._prepare_source(source_dir)
+
+            (source_dir / "scripts" / "extensions.json").write_text(
+                json.dumps({"extensions": {}}),
+                encoding="utf-8",
+            )
+            source_file = source_dir / "src" / "ko" / "sample" / "src" / "Sample.kt"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text(
+                "\n".join([
+                    "class Sample {",
+                    '    override val name = "Sample"',
+                    '    override val lang = "ko"',
+                    '    private val fallbackBaseUrl = "https://fallback.example.com"',
+                    "    override val baseUrl: String",
+                    "        get() = resolveBaseUrl()",
+                    "}",
+                ]),
+                encoding="utf-8",
+            )
+
+            self._run_update(source_dir, deploy_dir)
+
+            index = json.loads((deploy_dir / "index.json").read_text(encoding="utf-8"))
+            source = index["extensions"][0]["sources"][0]
+            self.assertEqual("https://fallback.example.com", source["homeUrl"])
+
 
 if __name__ == "__main__":
     unittest.main()
