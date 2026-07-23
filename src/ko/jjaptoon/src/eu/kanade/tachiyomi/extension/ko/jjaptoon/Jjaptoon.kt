@@ -62,6 +62,14 @@ class Jjaptoon :
             .build()
     }
 
+    private val noRedirectClient by lazy {
+        network.client.newBuilder()
+            .followRedirects(false)
+            .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .build()
+    }
+
     private val latestDomainInterceptor = Interceptor { chain ->
         chain.proceed(rewriteRequestToLatestDomain(chain.request()))
     }
@@ -505,7 +513,8 @@ class Jjaptoon :
             preferences.edit()
                 .putLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, synchronizedNow)
                 .apply()
-            fetchLatestBaseUrl()?.also { latestBaseUrl ->
+            val discoveredBaseUrl = fetchLatestBaseUrl() ?: resolveRedirectBaseUrl()
+            discoveredBaseUrl?.also { latestBaseUrl ->
                 preferences.edit()
                     .putString(LATEST_DOMAIN_URL_PREF, latestBaseUrl)
                     .putLong(LATEST_DOMAIN_FETCHED_AT_PREF, synchronizedNow)
@@ -527,6 +536,12 @@ class Jjaptoon :
             if (!response.isSuccessful) return@use null
             val data = json.decodeFromString<LatestDomainResponse>(response.body.string())
             normalizeDiscoveredBaseUrl(data.domain)
+        }
+    }.getOrNull()
+
+    private fun resolveRedirectBaseUrl(): String? = runCatching {
+        noRedirectClient.newCall(GET(fallbackBaseUrl)).execute().use { response ->
+            response.header("Location")?.let(::normalizeDiscoveredBaseUrl)
         }
     }.getOrNull()
 
