@@ -17,8 +17,13 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.tryParse
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -27,6 +32,7 @@ import rx.Observable
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.TimeUnit
 
 class Jjaptoon :
     HttpSource(),
@@ -34,19 +40,39 @@ class Jjaptoon :
 
     override val name = "짭툰"
 
-    private val defaultBaseUrl = "https://www.jjaptoon003.com"
+    private val fallbackBaseUrl = "https://www.jjaptoon004.com"
 
     private val baseUrlPref = "overrideBaseUrl_v${AppInfo.getVersionName()}"
+    private val manualBaseUrlPref = "${baseUrlPref}_manual"
 
-    override val baseUrl by lazy { getPrefBaseUrl().trimEnd('/') }
+    override val baseUrl: String
+        get() = getActiveBaseUrl()
 
     override val lang = "ko"
 
     override val supportsLatest = true
 
-    override val client = network.cloudflareClient
-
     private val preferences: SharedPreferences by getPreferencesLazy()
+    private val domainRefreshLock = Any()
+
+    private val domainLookupClient by lazy {
+        network.client.newBuilder()
+            .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val latestDomainInterceptor = Interceptor { chain ->
+        chain.proceed(rewriteRequestToLatestDomain(chain.request()))
+    }
+
+    override val client by lazy {
+        network.cloudflareClient.newBuilder()
+            .apply {
+                interceptors().add(0, latestDomainInterceptor)
+            }
+            .build()
+    }
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .set("Referer", "$baseUrl/")
@@ -355,34 +381,193 @@ class Jjaptoon :
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        getPrefBaseUrl()
+        migrateLegacyBaseUrl()
 
         EditTextPreference(screen.context).apply {
             key = baseUrlPref
             title = BASE_URL_PREF_TITLE
-            summary = BASE_URL_PREF_SUMMARY
-            setDefaultValue(defaultBaseUrl)
+            summary = baseUrlPreferenceSummary()
+            setDefaultValue("")
             dialogTitle = BASE_URL_PREF_TITLE
-            dialogMessage = "Default: $defaultBaseUrl"
+            dialogMessage = "비워두면 $LATEST_DOMAIN_ENDPOINT 에서 최신 주소를 자동 확인합니다."
+            setOnPreferenceChangeListener { preference, newValue ->
+                val value = (newValue as? String).orEmpty().trim()
+                if (value.isEmpty()) {
+                    preferences.edit()
+                        .remove(baseUrlPref)
+                        .remove(manualBaseUrlPref)
+                        .apply()
+                    (preference as EditTextPreference).text = ""
+                    preference.summary = baseUrlPreferenceSummary()
+                    return@setOnPreferenceChangeListener false
+                }
+
+                val normalized = normalizeManualBaseUrl(value)
+                    ?: return@setOnPreferenceChangeListener false
+                preferences.edit()
+                    .putString(baseUrlPref, normalized)
+                    .putBoolean(manualBaseUrlPref, true)
+                    .apply()
+                (preference as EditTextPreference).text = normalized
+                preference.summary = "현재 수동 주소: $normalized"
+                false
+            }
         }.also(screen::addPreference)
     }
 
-    private fun getPrefBaseUrl(): String {
+    private fun getActiveBaseUrl(): String = getManualBaseUrl()
+        ?: getCachedLatestBaseUrl()
+        ?: fallbackBaseUrl
+
+    private fun getManualBaseUrl(): String? {
         val savedBaseUrl = preferences.getString(baseUrlPref, null)?.trimEnd('/')
-        if (savedBaseUrl.isNullOrBlank()) {
-            return defaultBaseUrl
-        }
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+        val isManual = preferences.getBoolean(manualBaseUrlPref, false)
 
-        if (savedBaseUrl in OLD_DEFAULT_BASE_URLS) {
+        if (!isManual && savedBaseUrl in OLD_DEFAULT_BASE_URLS) {
             preferences.edit()
-                .putString(baseUrlPref, defaultBaseUrl)
+                .remove(baseUrlPref)
+                .remove(manualBaseUrlPref)
                 .apply()
-
-            return defaultBaseUrl
+            return null
         }
 
-        return savedBaseUrl
+        return normalizeManualBaseUrl(savedBaseUrl)
     }
+
+    private fun migrateLegacyBaseUrl() {
+        getManualBaseUrl()
+    }
+
+    private fun rewriteRequestToLatestDomain(request: Request): Request {
+        if (getManualBaseUrl() != null || !request.url.host.matches(JJAPTOON_HOST_REGEX)) {
+            return request
+        }
+
+        val latestBaseUrl = resolveLatestBaseUrl().toHttpUrl()
+        if (
+            request.url.scheme == latestBaseUrl.scheme &&
+            request.url.host == latestBaseUrl.host &&
+            request.url.port == latestBaseUrl.port
+        ) {
+            return request
+        }
+
+        val rewrittenUrl = request.url.newBuilder()
+            .scheme(latestBaseUrl.scheme)
+            .host(latestBaseUrl.host)
+            .port(latestBaseUrl.port)
+            .build()
+        val builder = request.newBuilder().url(rewrittenUrl)
+        request.header("Referer")
+            ?.toHttpUrlOrNull()
+            ?.takeIf { it.host.matches(JJAPTOON_HOST_REGEX) }
+            ?.let { referer ->
+                builder.header(
+                    "Referer",
+                    referer.newBuilder()
+                        .scheme(latestBaseUrl.scheme)
+                        .host(latestBaseUrl.host)
+                        .port(latestBaseUrl.port)
+                        .build()
+                        .toString(),
+                )
+            }
+        return builder.build()
+    }
+
+    private fun resolveLatestBaseUrl(): String {
+        val now = System.currentTimeMillis()
+        val cached = getCachedLatestBaseUrl()
+        val fetchedAt = preferences.getLong(LATEST_DOMAIN_FETCHED_AT_PREF, 0L)
+        if (cached != null && now - fetchedAt < DOMAIN_CACHE_DURATION_MS) return cached
+
+        val attemptedAt = preferences.getLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, 0L)
+        if (now - attemptedAt < DOMAIN_RETRY_DELAY_MS) return cached ?: fallbackBaseUrl
+
+        return synchronized(domainRefreshLock) {
+            val synchronizedNow = System.currentTimeMillis()
+            val synchronizedCached = getCachedLatestBaseUrl()
+            val synchronizedFetchedAt = preferences.getLong(LATEST_DOMAIN_FETCHED_AT_PREF, 0L)
+            if (
+                synchronizedCached != null &&
+                synchronizedNow - synchronizedFetchedAt < DOMAIN_CACHE_DURATION_MS
+            ) {
+                return@synchronized synchronizedCached
+            }
+
+            val synchronizedAttemptedAt = preferences.getLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, 0L)
+            if (synchronizedNow - synchronizedAttemptedAt < DOMAIN_RETRY_DELAY_MS) {
+                return@synchronized synchronizedCached ?: fallbackBaseUrl
+            }
+
+            preferences.edit()
+                .putLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, synchronizedNow)
+                .apply()
+            fetchLatestBaseUrl()?.also { latestBaseUrl ->
+                preferences.edit()
+                    .putString(LATEST_DOMAIN_URL_PREF, latestBaseUrl)
+                    .putLong(LATEST_DOMAIN_FETCHED_AT_PREF, synchronizedNow)
+                    .apply()
+            } ?: synchronizedCached ?: fallbackBaseUrl
+        }
+    }
+
+    private fun fetchLatestBaseUrl(): String? = runCatching {
+        domainLookupClient.newCall(
+            GET(
+                LATEST_DOMAIN_ENDPOINT,
+                Headers.Builder()
+                    .set("Accept", "application/json")
+                    .set("Cache-Control", "no-cache")
+                    .build(),
+            ),
+        ).execute().use { response ->
+            if (!response.isSuccessful) return@use null
+            val data = json.decodeFromString<LatestDomainResponse>(response.body.string())
+            normalizeDiscoveredBaseUrl(data.domain)
+        }
+    }.getOrNull()
+
+    private fun getCachedLatestBaseUrl(): String? = preferences
+        .getString(LATEST_DOMAIN_URL_PREF, null)
+        ?.let(::normalizeDiscoveredBaseUrl)
+
+    private fun normalizeDiscoveredBaseUrl(value: String): String? {
+        val url = value.trim().trimEnd('/').toHttpUrlOrNull() ?: return null
+        if (
+            url.scheme != "https" ||
+            !url.host.matches(JJAPTOON_HOST_REGEX) ||
+            url.port != 443 ||
+            url.encodedPath != "/" ||
+            url.query != null ||
+            url.username.isNotEmpty() ||
+            url.password.isNotEmpty()
+        ) {
+            return null
+        }
+        return url.newBuilder().encodedPath("/").build().toString().trimEnd('/')
+    }
+
+    private fun normalizeManualBaseUrl(value: String): String? {
+        val url = value.trim().trimEnd('/').toHttpUrlOrNull() ?: return null
+        if (
+            url.scheme != "https" ||
+            url.port != 443 ||
+            url.encodedPath != "/" ||
+            url.query != null ||
+            url.username.isNotEmpty() ||
+            url.password.isNotEmpty()
+        ) {
+            return null
+        }
+        return url.newBuilder().encodedPath("/").build().toString().trimEnd('/')
+    }
+
+    private fun baseUrlPreferenceSummary(): String = getManualBaseUrl()
+        ?.let { "현재 수동 주소: $it" }
+        ?: "현재 자동 주소: ${getCachedLatestBaseUrl() ?: fallbackBaseUrl}\n$BASE_URL_PREF_SUMMARY"
 
     private fun parseStatus(text: String): Int = when {
         "완결" in text -> SManga.COMPLETED
@@ -398,16 +583,32 @@ class Jjaptoon :
 
     companion object {
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
-        private const val BASE_URL_PREF_SUMMARY = "Override default domain with a different one"
+        private const val BASE_URL_PREF_SUMMARY = "비워두면 공식 포털에서 최신 주소를 자동 확인합니다."
+        private const val LATEST_DOMAIN_ENDPOINT = "https://www.jjaptoon.com/data/domain.json"
+        private const val LATEST_DOMAIN_URL_PREF = "latest_domain_url"
+        private const val LATEST_DOMAIN_FETCHED_AT_PREF = "latest_domain_fetched_at"
+        private const val LATEST_DOMAIN_ATTEMPTED_AT_PREF = "latest_domain_attempted_at"
+        private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
+        private const val DOMAIN_CACHE_DURATION_MS = 12 * 60 * 60 * 1000L
+        private const val DOMAIN_RETRY_DELAY_MS = 15 * 60 * 1000L
         private const val FILTER_ALL = "all"
         private const val SORT_LATEST = "latest"
         private const val SORT_POPULAR = "popular"
         private const val HOME_PAGINATOR = "comicsPage"
 
         private val OLD_DEFAULT_BASE_URLS = setOf(
+            "https://www.jjaptoon003.com",
             "https://jjaptoon003.com",
             "https://jjabtoon003.com",
             "https://www.jjabtoon003.com",
+        )
+
+        private val JJAPTOON_HOST_REGEX = Regex("^(?:www\\.)?jjaptoon\\d{3}\\.com$")
+        private val json = Json { ignoreUnknownKeys = true }
+
+        @Serializable
+        private data class LatestDomainResponse(
+            val domain: String,
         )
 
         private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).apply {
