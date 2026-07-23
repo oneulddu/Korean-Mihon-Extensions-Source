@@ -12,6 +12,7 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.tryParse
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Element
@@ -168,7 +169,7 @@ class Xtoon : HttpSource() {
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
         return document.select("img.lazy-read[data-original]").mapIndexed { index, element ->
-            Page(index, imageUrl = element.absUrl("data-original"))
+            Page(index, imageUrl = element.absUrl("data-original").toWorkingImageUrl())
         }
     }
 
@@ -188,6 +189,22 @@ class Xtoon : HttpSource() {
         hasAttr("data-src") -> absUrl("data-src")
         else -> absUrl("src")
     }.takeIf { it.isNotBlank() && !it.contains("/packs/mccms/empty.png") }
+        ?.toWorkingImageUrl()
+
+    private fun String.toWorkingImageUrl(): String {
+        val url = toHttpUrlOrNull() ?: return this
+        if (url.host != SOURCE_CDN_HOST) return this
+
+        return url.newBuilder()
+            .host(WORKING_CDN_HOST)
+            .build()
+            .toString()
+    }
+
+    private companion object {
+        const val SOURCE_CDN_HOST = "cdn.xtoon33.com"
+        const val WORKING_CDN_HOST = "xtoon2.b-cdn.net"
+    }
 
     private class ThemeFilter :
         UriPartFilter(

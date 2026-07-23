@@ -1,7 +1,7 @@
 ext {
     extName = 'Xtoon'
     extClass = '.Xtoon'
-    extVersionCode = 4
+    extVersionCode = 5
     isNsfw = true
 }
 
