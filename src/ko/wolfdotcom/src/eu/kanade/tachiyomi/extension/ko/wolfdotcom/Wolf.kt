@@ -13,8 +13,13 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.BaseUrlCacheKeys
+import keiyoushi.utils.DynamicBaseUrlResolver
+import keiyoushi.utils.SharedPreferencesBaseUrlStorage
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.normalizeBaseUrl
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.rewriteBaseUrl
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.Serializable
@@ -65,6 +70,35 @@ open class Wolf(
         .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
+
+    private val latestBaseUrlResolver by lazy {
+        migrateLegacyDomainCache()
+        DynamicBaseUrlResolver(
+            storage = SharedPreferencesBaseUrlStorage(preference),
+            keys = BaseUrlCacheKeys(
+                cachedUrl = PREF_LATEST_DOMAIN_URL,
+                fetchedAt = PREF_LATEST_DOMAIN_FETCHED_AT,
+                attemptedAt = PREF_LATEST_DOMAIN_ATTEMPTED_AT,
+            ),
+            fallbackBaseUrl = { "https://${domainHost(domainNumber)}" },
+            isAllowedAutomaticUrl = { it.host.matches(domainHostRegex) },
+            discoverBaseUrl = ::fetchLatestBaseUrl,
+            redirectBaseUrl = ::resolveRedirectBaseUrl,
+            onAutomaticUrlResolved = { resolvedBaseUrl ->
+                domainNumberRegex.matchEntire(resolvedBaseUrl.toHttpUrl().host)
+                    ?.groupValues
+                    ?.get(1)
+                    ?.let { domainNumber = it }
+            },
+        )
+    }
+
+    private fun migrateLegacyDomainCache() {
+        if (preference.getString(PREF_LATEST_DOMAIN_URL, null) != null) return
+        preference.getString(PREF_LATEST_DOMAIN_NUM, null)
+            ?.takeIf { domainHost(it).matches(domainHostRegex) }
+            ?.let { preference.edit().putString(PREF_LATEST_DOMAIN_URL, "https://${domainHost(it)}").apply() }
+    }
 
     override fun fetchPopularManga(page: Int): Observable<MangasPage> = fetchSearchManga(page, "", FilterList(SortFilter(1)))
 
@@ -281,24 +315,11 @@ open class Wolf(
         .getString(PREF_MANUAL_BASE_URL, null)
         ?.let(::normalizeManualBaseUrl)
 
-    private fun normalizeManualBaseUrl(value: String): String? {
-        val url = value.trim().trimEnd('/').toHttpUrlOrNull() ?: return null
-        if (
-            url.scheme != "https" ||
-            url.port != 443 ||
-            url.encodedPath != "/" ||
-            url.query != null ||
-            url.username.isNotEmpty() ||
-            url.password.isNotEmpty()
-        ) {
-            return null
-        }
-        return url.newBuilder().encodedPath("/").build().toString().trimEnd('/')
-    }
+    private fun normalizeManualBaseUrl(value: String): String? = normalizeBaseUrl(value)
 
     private fun baseUrlPreferenceSummary(): String = getManualBaseUrl()
         ?.let { "현재 수동 주소: $it" }
-        ?: "현재 자동 주소: https://${domainHost(getCachedLatestDomainNumber() ?: domainNumber)}\n" +
+        ?: "현재 자동 주소: ${latestBaseUrlResolver.cachedBaseUrl() ?: "https://${domainHost(domainNumber)}"}\n" +
         "비워두면 공식 안내 사이트에서 최신 주소를 자동 확인합니다."
 
     private var domainNumber = ""
@@ -339,77 +360,15 @@ open class Wolf(
         val isManualHost = manualBaseUrl != null && request.url.host == manualBaseUrl.host
         if (!isAutomaticHost && !isManualHost) return chain.proceed(request)
 
-        val resolvedBaseUrl = manualBaseUrl ?: "https://${domainHost(resolveLatestDomainNumber())}".toHttpUrl()
-        val rewrittenRequest = if (
-            request.url.scheme == resolvedBaseUrl.scheme &&
-            request.url.host == resolvedBaseUrl.host &&
-            request.url.port == resolvedBaseUrl.port
-        ) {
-            request
-        } else {
-            request.newBuilder()
-                .url(
-                    request.url.newBuilder()
-                        .scheme(resolvedBaseUrl.scheme)
-                        .host(resolvedBaseUrl.host)
-                        .port(resolvedBaseUrl.port)
-                        .build(),
-                )
-                .build()
+        val resolvedBaseUrl = manualBaseUrl?.toString() ?: latestBaseUrlResolver.resolve()
+        val rewrittenRequest = request.rewriteBaseUrl(resolvedBaseUrl) { host ->
+            host.matches(domainHostRegex) || host == manualBaseUrl?.host
         }
 
         return chain.proceed(rewrittenRequest)
     }
 
-    private fun resolveLatestDomainNumber(): String {
-        val now = System.currentTimeMillis()
-        val cachedDomainNumber = getCachedLatestDomainNumber()
-        val fetchedAt = preference.getLong(PREF_LATEST_DOMAIN_FETCHED_AT, 0L)
-        if (cachedDomainNumber != null && now - fetchedAt < DOMAIN_CACHE_DURATION_MS) {
-            domainNumber = cachedDomainNumber
-            return cachedDomainNumber
-        }
-
-        val attemptedAt = preference.getLong(PREF_LATEST_DOMAIN_ATTEMPTED_AT, 0L)
-        if (now - attemptedAt < DOMAIN_RETRY_DELAY_MS) return cachedDomainNumber ?: domainNumber
-
-        return synchronized(domainRefreshLock) {
-            val synchronizedNow = System.currentTimeMillis()
-            val synchronizedCachedDomainNumber = getCachedLatestDomainNumber()
-            val synchronizedFetchedAt = preference.getLong(PREF_LATEST_DOMAIN_FETCHED_AT, 0L)
-            if (
-                synchronizedCachedDomainNumber != null &&
-                synchronizedNow - synchronizedFetchedAt < DOMAIN_CACHE_DURATION_MS
-            ) {
-                domainNumber = synchronizedCachedDomainNumber
-                return@synchronized synchronizedCachedDomainNumber
-            }
-
-            val synchronizedAttemptedAt = preference.getLong(PREF_LATEST_DOMAIN_ATTEMPTED_AT, 0L)
-            if (synchronizedNow - synchronizedAttemptedAt < DOMAIN_RETRY_DELAY_MS) {
-                return@synchronized synchronizedCachedDomainNumber ?: domainNumber
-            }
-
-            preference.edit()
-                .putLong(PREF_LATEST_DOMAIN_ATTEMPTED_AT, synchronizedNow)
-                .apply()
-
-            val discoveredDomainNumber = fetchLatestDomainNumber() ?: resolveRedirectDomainNumber()
-            val resolvedDomainNumber = discoveredDomainNumber ?: synchronizedCachedDomainNumber ?: domainNumber
-            domainNumber = resolvedDomainNumber
-
-            if (discoveredDomainNumber != null) {
-                preference.edit()
-                    .putString(PREF_LATEST_DOMAIN_NUM, discoveredDomainNumber)
-                    .putLong(PREF_LATEST_DOMAIN_FETCHED_AT, synchronizedNow)
-                    .apply()
-            }
-
-            resolvedDomainNumber
-        }
-    }
-
-    private fun fetchLatestDomainNumber(): String? = runCatching {
+    private fun fetchLatestBaseUrl(): String? = runCatching {
         domainLookupClient.newCall(
             GET(
                 LATEST_DOMAIN_ENDPOINT,
@@ -426,27 +385,24 @@ open class Wolf(
                 .asSequence()
                 .mapNotNull { it.attr("href").toHttpUrlOrNull() }
                 .firstOrNull(::isValidDiscoveredDomain)
-                ?.host
-                ?.let { domainNumberRegex.matchEntire(it)?.groupValues?.get(1) }
+                ?.toString()
+                ?.trimEnd('/')
         }
     }.getOrNull()
 
-    private fun resolveRedirectDomainNumber(): String? = runCatching {
+    private fun resolveRedirectBaseUrl(): String? = runCatching {
         noRedirectClient.newCall(GET("https://${domainHost(domainNumber)}", headers)).execute().use { response ->
             response.header("Location")
                 ?.toHttpUrlOrNull()
                 ?.takeIf(::isValidDiscoveredDomain)
-                ?.host
-                ?.let { domainNumberRegex.matchEntire(it)?.groupValues?.get(1) }
-                ?: response.request.url.host
-                    .takeIf { it.matches(domainHostRegex) }
-                    ?.let { domainNumberRegex.matchEntire(it)?.groupValues?.get(1) }
+                ?.toString()
+                ?.trimEnd('/')
+                ?: response.request.url
+                    .takeIf(::isValidDiscoveredDomain)
+                    ?.toString()
+                    ?.trimEnd('/')
         }
     }.getOrNull()
-
-    private fun getCachedLatestDomainNumber(): String? = preference
-        .getString(PREF_LATEST_DOMAIN_NUM, null)
-        ?.takeIf { domainHost(it).matches(domainHostRegex) }
 
     private fun isValidDiscoveredDomain(url: okhttp3.HttpUrl): Boolean = url.scheme == "https" &&
         url.host.matches(domainHostRegex) &&
@@ -475,7 +431,6 @@ open class Wolf(
 
     companion object {
         private const val MAX_SYNTHETIC_CHAPTERS = 5_000
-        private val domainRefreshLock = Any()
         private val domainHostRegex = Regex("""^wfwf\d+\.com$""")
         private val domainNumberRegex = Regex("""^wfwf(\d+)\.com$""")
     }
@@ -485,9 +440,8 @@ private const val PREF_DOMAIN_NUM = "domain_number"
 private const val PREF_DOMAIN_NUM_DEFAULT = "domain_number_default"
 private const val PREF_MANUAL_BASE_URL = "manual_base_url"
 private const val PREF_LATEST_DOMAIN_NUM = "latest_domain_number"
+private const val PREF_LATEST_DOMAIN_URL = "latest_domain_url"
 private const val PREF_LATEST_DOMAIN_FETCHED_AT = "latest_domain_fetched_at"
 private const val PREF_LATEST_DOMAIN_ATTEMPTED_AT = "latest_domain_attempted_at"
 private const val LATEST_DOMAIN_ENDPOINT = "https://a14c.com/"
 private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
-private const val DOMAIN_CACHE_DURATION_MS = 12 * 60 * 60 * 1000L
-private const val DOMAIN_RETRY_DELAY_MS = 15 * 60 * 1000L
