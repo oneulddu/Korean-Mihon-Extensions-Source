@@ -360,7 +360,12 @@ class Jjaptoon :
                 SChapter.create().apply {
                     setUrlWithoutDomain(element.absUrl("href"))
                     name = element.selectFirst("p")?.text()?.trim().orEmpty()
-                    date_upload = dateFormat.tryParse(element.selectFirst("p + p")?.text().orEmpty())
+                    date_upload = element.select("p")
+                        .asSequence()
+                        .map { it.text().trim() }
+                        .firstOrNull(chapterDateRegex::matches)
+                        ?.let(dateFormat::tryParse)
+                        ?: 0L
                 }
             }
     }
@@ -628,7 +633,9 @@ class Jjaptoon :
 
         private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).apply {
             timeZone = TimeZone.getTimeZone("Asia/Seoul")
+            isLenient = false
         }
+        private val chapterDateRegex = Regex("""\d{4}-\d{2}-\d{2}""")
 
         private val imageSrcRegex = """loaded\s*\?\s*'([^']+)'""".toRegex()
 
