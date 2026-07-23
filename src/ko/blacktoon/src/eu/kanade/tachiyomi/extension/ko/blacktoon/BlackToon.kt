@@ -16,6 +16,7 @@ import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
@@ -38,7 +39,7 @@ class BlackToon :
     private val domainRefreshLock = Any()
     private var currentBaseUrlHost = ""
     override val baseUrl: String
-        get() = "https://blacktoon$domainNumber.com"
+        get() = getManualBaseUrl() ?: "https://blacktoon$domainNumber.com"
 
     private val cdnUrl = "https://aa3cc9.speedwebgo.com/"
 
@@ -50,20 +51,31 @@ class BlackToon :
 
     override val client = network.client.newBuilder().addInterceptor { chain ->
         val originalRequest = chain.request()
-        val isBlackToonRequest = originalRequest.url.host.matches(domainHostRegex)
-        val resolvedBaseUrlHost = if (isBlackToonRequest) resolveBaseUrlHost() else currentBaseUrlHost
+        val manualBaseUrl = getManualBaseUrl()?.toHttpUrl()
+        val isAutomaticHost = originalRequest.url.host.matches(domainHostRegex)
+        val isManualHost = manualBaseUrl != null && originalRequest.url.host == manualBaseUrl.host
+        val isManagedRequest = isAutomaticHost || isManualHost
+        val resolvedBaseUrl = when {
+            !isManagedRequest -> null
+            manualBaseUrl != null -> manualBaseUrl
+            else -> "https://${resolveBaseUrlHost()}".toHttpUrl()
+        }
+
+        if (resolvedBaseUrl != null) {
+            currentBaseUrlHost = resolvedBaseUrl.host
+        }
 
         val request = originalRequest.newBuilder().apply {
-            if (isBlackToonRequest && resolvedBaseUrlHost.isNotBlank()) {
+            if (resolvedBaseUrl != null) {
                 url(
                     originalRequest.url.newBuilder()
-                        .host(resolvedBaseUrlHost)
+                        .scheme(resolvedBaseUrl.scheme)
+                        .host(resolvedBaseUrl.host)
+                        .port(resolvedBaseUrl.port)
                         .build(),
                 )
-            }
-            if (resolvedBaseUrlHost.isNotBlank()) {
-                header("Referer", "https://$resolvedBaseUrlHost/")
-                header("Origin", "https://$resolvedBaseUrlHost")
+                header("Referer", "$resolvedBaseUrl")
+                header("Origin", resolvedBaseUrl.toString().trimEnd('/'))
             }
         }.build()
 
@@ -219,21 +231,53 @@ class BlackToon :
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
-            key = PREF_DOMAIN_NUMBER
-            title = "도메인 번호 (blacktoon#.com)"
-            summary = "최신 주소를 blacktoonurl.net에서 자동 확인합니다.\n현재 도메인 번호: $domainNumber"
-            setDefaultValue(DEFAULT_DOMAIN_NUMBER)
-            setOnPreferenceChangeListener { _, newValue ->
-                val value = (newValue as String).trim()
-                if (value.isEmpty() || value.toIntOrNull() == null) {
-                    false
-                } else {
-                    saveDomainNumber(value, resetCachedHost = true)
-                    false
+            key = PREF_MANUAL_BASE_URL
+            title = "Override BaseUrl"
+            summary = baseUrlPreferenceSummary()
+            setDefaultValue("")
+            dialogMessage = "비워두면 $LATEST_DOMAIN_ENDPOINT 에서 최신 주소를 자동 확인합니다."
+            setOnPreferenceChangeListener { preference, newValue ->
+                val value = (newValue as? String).orEmpty().trim()
+                if (value.isEmpty()) {
+                    preferences.edit().remove(PREF_MANUAL_BASE_URL).apply()
+                    (preference as EditTextPreference).text = ""
+                    preference.summary = baseUrlPreferenceSummary()
+                    return@setOnPreferenceChangeListener false
                 }
+
+                val normalized = normalizeManualBaseUrl(value)
+                    ?: return@setOnPreferenceChangeListener false
+                preferences.edit().putString(PREF_MANUAL_BASE_URL, normalized).apply()
+                (preference as EditTextPreference).text = normalized
+                preference.summary = "현재 수동 주소: $normalized"
+                false
             }
         }.also(screen::addPreference)
     }
+
+    private fun getManualBaseUrl(): String? = preferences
+        .getString(PREF_MANUAL_BASE_URL, null)
+        ?.let(::normalizeManualBaseUrl)
+
+    private fun normalizeManualBaseUrl(value: String): String? {
+        val url = value.trim().trimEnd('/').toHttpUrlOrNull() ?: return null
+        if (
+            url.scheme != "https" ||
+            url.port != 443 ||
+            url.encodedPath != "/" ||
+            url.query != null ||
+            url.username.isNotEmpty() ||
+            url.password.isNotEmpty()
+        ) {
+            return null
+        }
+        return url.newBuilder().encodedPath("/").build().toString().trimEnd('/')
+    }
+
+    private fun baseUrlPreferenceSummary(): String = getManualBaseUrl()
+        ?.let { "현재 수동 주소: $it" }
+        ?: "현재 자동 주소: https://${getCachedLatestDomainHost() ?: domainHost(domainNumber)}\n" +
+        "비워두면 공식 안내 사이트에서 최신 주소를 자동 확인합니다."
 
     private var domainNumber = ""
         get() {
@@ -285,7 +329,9 @@ class BlackToon :
 
         val attemptedAt = preferences.getLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, 0L)
         if (now - attemptedAt < DOMAIN_RETRY_DELAY_MS) {
-            return cachedHost ?: currentBaseUrlHost.ifBlank(::resolveRedirectDomainHost)
+            return cachedHost ?: currentBaseUrlHost.ifBlank {
+                resolveRedirectDomainHost() ?: domainHost(domainNumber)
+            }
         }
 
         return synchronized(domainRefreshLock) {
@@ -303,24 +349,26 @@ class BlackToon :
             val synchronizedAttemptedAt = preferences.getLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, 0L)
             if (synchronizedNow - synchronizedAttemptedAt < DOMAIN_RETRY_DELAY_MS) {
                 return@synchronized synchronizedCachedHost
-                    ?: currentBaseUrlHost.ifBlank(::resolveRedirectDomainHost)
+                    ?: currentBaseUrlHost.ifBlank {
+                        resolveRedirectDomainHost() ?: domainHost(domainNumber)
+                    }
             }
 
             preferences.edit()
                 .putLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, synchronizedNow)
                 .apply()
 
-            val fetchedHost = fetchLatestDomainHost()
-            val resolvedHost = fetchedHost
+            val discoveredHost = fetchLatestDomainHost() ?: resolveRedirectDomainHost()
+            val resolvedHost = discoveredHost
                 ?: synchronizedCachedHost
-                ?: currentBaseUrlHost.ifBlank(::resolveRedirectDomainHost)
+                ?: currentBaseUrlHost.ifBlank { domainHost(domainNumber) }
 
             currentBaseUrlHost = resolvedHost
             updateDomainNumberFromHost(resolvedHost)
 
-            if (fetchedHost != null) {
+            if (discoveredHost != null) {
                 preferences.edit()
-                    .putString(LATEST_DOMAIN_HOST_PREF, fetchedHost)
+                    .putString(LATEST_DOMAIN_HOST_PREF, discoveredHost)
                     .putLong(LATEST_DOMAIN_FETCHED_AT_PREF, synchronizedNow)
                     .apply()
             }
@@ -355,7 +403,7 @@ class BlackToon :
         .getString(LATEST_DOMAIN_HOST_PREF, null)
         ?.takeIf { it.matches(domainHostRegex) }
 
-    private fun resolveRedirectDomainHost(): String = runCatching {
+    private fun resolveRedirectDomainHost(): String? = runCatching {
         noRedirectClient.newCall(GET(baseUrl, headers)).execute().use { response ->
             response.headers["location"]
                 ?.toHttpUrlOrNull()
@@ -363,7 +411,7 @@ class BlackToon :
                 ?.host
                 ?: response.request.url.host.takeIf { it.matches(domainHostRegex) }
         }
-    }.getOrNull() ?: domainHost(domainNumber)
+    }.getOrNull()
 
     private fun isValidDiscoveredDomain(url: okhttp3.HttpUrl): Boolean = url.scheme == "https" &&
         url.host.matches(domainHostRegex) &&
@@ -388,6 +436,7 @@ class BlackToon :
         private const val USER_AGENT =
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
         private const val PREF_DOMAIN_NUMBER = "domain_number"
+        private const val PREF_MANUAL_BASE_URL = "manual_base_url"
         private const val DEFAULT_DOMAIN_NUMBER = "416"
         private const val LATEST_DOMAIN_ENDPOINT = "https://blacktoonurl.net/"
         private const val LATEST_DOMAIN_HOST_PREF = "latest_domain_host"
