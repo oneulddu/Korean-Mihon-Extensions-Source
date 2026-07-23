@@ -44,7 +44,7 @@ open class Wolf(
     override val lang = "ko"
 
     override val baseUrl: String
-        get() = "https://wfwf$domainNumber.com"
+        get() = getManualBaseUrl() ?: "https://wfwf$domainNumber.com"
 
     override val supportsLatest = true
 
@@ -56,6 +56,12 @@ open class Wolf(
     private val preference: SharedPreferences by getPreferencesLazy()
 
     private val domainLookupClient = network.client.newBuilder()
+        .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .build()
+
+    private val noRedirectClient = network.client.newBuilder()
+        .followRedirects(false)
         .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
@@ -247,25 +253,53 @@ open class Wolf(
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
-            key = PREF_DOMAIN_NUM
-            title = "도메인 번호"
-            summary = "최신 주소를 a14c.com에서 자동 확인합니다.\n현재 도메인 번호: $domainNumber"
-            setOnPreferenceChangeListener { _, newValue ->
-                val value = newValue as String
-                if (value.isEmpty() || value.toIntOrNull() == null) {
-                    false
-                } else {
-                    domainNumber = value.trim()
-                    preference.edit()
-                        .remove(PREF_LATEST_DOMAIN_NUM)
-                        .remove(PREF_LATEST_DOMAIN_FETCHED_AT)
-                        .remove(PREF_LATEST_DOMAIN_ATTEMPTED_AT)
-                        .apply()
-                    false
+            key = PREF_MANUAL_BASE_URL
+            title = "Override BaseUrl"
+            summary = baseUrlPreferenceSummary()
+            setDefaultValue("")
+            dialogMessage = "비워두면 $LATEST_DOMAIN_ENDPOINT 에서 최신 주소를 자동 확인합니다."
+            setOnPreferenceChangeListener { preference, newValue ->
+                val value = (newValue as? String).orEmpty().trim()
+                if (value.isEmpty()) {
+                    this@Wolf.preference.edit().remove(PREF_MANUAL_BASE_URL).apply()
+                    (preference as EditTextPreference).text = ""
+                    preference.summary = baseUrlPreferenceSummary()
+                    return@setOnPreferenceChangeListener false
                 }
+
+                val normalized = normalizeManualBaseUrl(value)
+                    ?: return@setOnPreferenceChangeListener false
+                this@Wolf.preference.edit().putString(PREF_MANUAL_BASE_URL, normalized).apply()
+                (preference as EditTextPreference).text = normalized
+                preference.summary = "현재 수동 주소: $normalized"
+                false
             }
         }.also(screen::addPreference)
     }
+
+    private fun getManualBaseUrl(): String? = preference
+        .getString(PREF_MANUAL_BASE_URL, null)
+        ?.let(::normalizeManualBaseUrl)
+
+    private fun normalizeManualBaseUrl(value: String): String? {
+        val url = value.trim().trimEnd('/').toHttpUrlOrNull() ?: return null
+        if (
+            url.scheme != "https" ||
+            url.port != 443 ||
+            url.encodedPath != "/" ||
+            url.query != null ||
+            url.username.isNotEmpty() ||
+            url.password.isNotEmpty()
+        ) {
+            return null
+        }
+        return url.newBuilder().encodedPath("/").build().toString().trimEnd('/')
+    }
+
+    private fun baseUrlPreferenceSummary(): String = getManualBaseUrl()
+        ?.let { "현재 수동 주소: $it" }
+        ?: "현재 자동 주소: https://${domainHost(getCachedLatestDomainNumber() ?: domainNumber)}\n" +
+        "비워두면 공식 안내 사이트에서 최신 주소를 자동 확인합니다."
 
     private var domainNumber = ""
         get() {
@@ -300,15 +334,27 @@ open class Wolf(
 
     private fun domainNumberInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        if (!request.url.host.matches(domainHostRegex)) return chain.proceed(request)
+        val manualBaseUrl = getManualBaseUrl()?.toHttpUrl()
+        val isAutomaticHost = request.url.host.matches(domainHostRegex)
+        val isManualHost = manualBaseUrl != null && request.url.host == manualBaseUrl.host
+        if (!isAutomaticHost && !isManualHost) return chain.proceed(request)
 
-        val latestDomainNumber = resolveLatestDomainNumber()
-        val latestHost = domainHost(latestDomainNumber)
-        val rewrittenRequest = if (request.url.host == latestHost) {
+        val resolvedBaseUrl = manualBaseUrl ?: "https://${domainHost(resolveLatestDomainNumber())}".toHttpUrl()
+        val rewrittenRequest = if (
+            request.url.scheme == resolvedBaseUrl.scheme &&
+            request.url.host == resolvedBaseUrl.host &&
+            request.url.port == resolvedBaseUrl.port
+        ) {
             request
         } else {
             request.newBuilder()
-                .url(request.url.newBuilder().host(latestHost).build())
+                .url(
+                    request.url.newBuilder()
+                        .scheme(resolvedBaseUrl.scheme)
+                        .host(resolvedBaseUrl.host)
+                        .port(resolvedBaseUrl.port)
+                        .build(),
+                )
                 .build()
         }
 
@@ -348,13 +394,13 @@ open class Wolf(
                 .putLong(PREF_LATEST_DOMAIN_ATTEMPTED_AT, synchronizedNow)
                 .apply()
 
-            val fetchedDomainNumber = fetchLatestDomainNumber()
-            val resolvedDomainNumber = fetchedDomainNumber ?: synchronizedCachedDomainNumber ?: domainNumber
+            val discoveredDomainNumber = fetchLatestDomainNumber() ?: resolveRedirectDomainNumber()
+            val resolvedDomainNumber = discoveredDomainNumber ?: synchronizedCachedDomainNumber ?: domainNumber
             domainNumber = resolvedDomainNumber
 
-            if (fetchedDomainNumber != null) {
+            if (discoveredDomainNumber != null) {
                 preference.edit()
-                    .putString(PREF_LATEST_DOMAIN_NUM, fetchedDomainNumber)
+                    .putString(PREF_LATEST_DOMAIN_NUM, discoveredDomainNumber)
                     .putLong(PREF_LATEST_DOMAIN_FETCHED_AT, synchronizedNow)
                     .apply()
             }
@@ -382,6 +428,19 @@ open class Wolf(
                 .firstOrNull(::isValidDiscoveredDomain)
                 ?.host
                 ?.let { domainNumberRegex.matchEntire(it)?.groupValues?.get(1) }
+        }
+    }.getOrNull()
+
+    private fun resolveRedirectDomainNumber(): String? = runCatching {
+        noRedirectClient.newCall(GET("https://${domainHost(domainNumber)}", headers)).execute().use { response ->
+            response.header("Location")
+                ?.toHttpUrlOrNull()
+                ?.takeIf(::isValidDiscoveredDomain)
+                ?.host
+                ?.let { domainNumberRegex.matchEntire(it)?.groupValues?.get(1) }
+                ?: response.request.url.host
+                    .takeIf { it.matches(domainHostRegex) }
+                    ?.let { domainNumberRegex.matchEntire(it)?.groupValues?.get(1) }
         }
     }.getOrNull()
 
@@ -424,6 +483,7 @@ open class Wolf(
 
 private const val PREF_DOMAIN_NUM = "domain_number"
 private const val PREF_DOMAIN_NUM_DEFAULT = "domain_number_default"
+private const val PREF_MANUAL_BASE_URL = "manual_base_url"
 private const val PREF_LATEST_DOMAIN_NUM = "latest_domain_number"
 private const val PREF_LATEST_DOMAIN_FETCHED_AT = "latest_domain_fetched_at"
 private const val PREF_LATEST_DOMAIN_ATTEMPTED_AT = "latest_domain_attempted_at"
