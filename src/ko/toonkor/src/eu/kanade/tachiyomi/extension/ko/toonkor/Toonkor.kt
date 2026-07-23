@@ -2,7 +2,8 @@ package eu.kanade.tachiyomi.extension.ko.toonkor
 
 import android.content.SharedPreferences
 import android.util.Base64
-import eu.kanade.tachiyomi.AppInfo
+import androidx.preference.EditTextPreference
+import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
@@ -15,6 +16,7 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.normalizeBaseUrl
 import keiyoushi.utils.tryParse
 import okhttp3.Request
 import okhttp3.Response
@@ -29,8 +31,6 @@ class Toonkor :
     override val name = "Toonkor"
 
     private val defaultBaseUrl = "https://tkor137.com"
-
-    private val baseUrlPref = "overrideBaseUrl_v${AppInfo.getVersionName()}"
 
     override val baseUrl by lazy { getPrefBaseUrl() }
 
@@ -146,31 +146,56 @@ class Toonkor :
 
     // Preferences
 
-    override fun setupPreferenceScreen(screen: androidx.preference.PreferenceScreen) {
-        val baseUrlPref = androidx.preference.EditTextPreference(screen.context).apply {
-            key = this@Toonkor.baseUrlPref
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        migrateLegacyBaseUrl()
+        EditTextPreference(screen.context).apply {
+            key = PREF_MANUAL_BASE_URL
             title = BASE_URL_PREF_TITLE
-            summary = BASE_URL_PREF_SUMMARY
-            setDefaultValue(defaultBaseUrl)
+            summary = baseUrlPreferenceSummary()
+            setDefaultValue("")
             dialogTitle = BASE_URL_PREF_TITLE
-            dialogMessage = "Default: $defaultBaseUrl"
-        }
+            dialogMessage = "비워두면 기본 주소 $defaultBaseUrl 을 사용합니다."
+            setOnPreferenceChangeListener { preference, newValue ->
+                val value = (newValue as? String).orEmpty().trim()
+                if (value.isEmpty()) {
+                    preferences.edit().remove(PREF_MANUAL_BASE_URL).apply()
+                    (preference as EditTextPreference).text = ""
+                    preference.summary = baseUrlPreferenceSummary()
+                    return@setOnPreferenceChangeListener false
+                }
 
-        screen.addPreference(baseUrlPref)
+                val normalized = normalizeBaseUrl(value) ?: return@setOnPreferenceChangeListener false
+                preferences.edit().putString(PREF_MANUAL_BASE_URL, normalized).apply()
+                (preference as EditTextPreference).text = normalized
+                preference.summary = "현재 수동 주소: $normalized"
+                false
+            }
+        }.also(screen::addPreference)
     }
 
     private fun getPrefBaseUrl(): String {
-        val savedBaseUrl = preferences.getString(baseUrlPref, null)?.trimEnd('/')
-
-        if (savedBaseUrl.isNullOrBlank()) return defaultBaseUrl
-
-        if (savedBaseUrl in oldDefaultBaseUrls) {
-            preferences.edit().putString(baseUrlPref, defaultBaseUrl).apply()
-            return defaultBaseUrl
-        }
-
-        return savedBaseUrl
+        migrateLegacyBaseUrl()
+        return preferences.getString(PREF_MANUAL_BASE_URL, null)
+            ?.let(::normalizeBaseUrl)
+            ?: defaultBaseUrl
     }
+
+    private fun migrateLegacyBaseUrl() {
+        if (preferences.contains(PREF_MIGRATED_BASE_URL)) return
+        val legacyManualUrl = preferences.all.asSequence()
+            .filter { (key, _) -> key.startsWith(LEGACY_BASE_URL_PREF_PREFIX) }
+            .mapNotNull { (_, value) -> (value as? String)?.let(::normalizeBaseUrl) }
+            .firstOrNull { it !in oldDefaultBaseUrls && it != defaultBaseUrl }
+        preferences.edit().apply {
+            legacyManualUrl?.let { putString(PREF_MANUAL_BASE_URL, it) }
+            putBoolean(PREF_MIGRATED_BASE_URL, true)
+        }.apply()
+    }
+
+    private fun baseUrlPreferenceSummary(): String = preferences.getString(PREF_MANUAL_BASE_URL, null)
+        ?.let(::normalizeBaseUrl)
+        ?.let { "현재 수동 주소: $it" }
+        ?: "현재 기본 주소: $defaultBaseUrl"
 
     companion object {
         private val oldDefaultBaseUrls = setOf(
@@ -178,7 +203,9 @@ class Toonkor :
             "https://tkor136.com",
         )
 
+        private const val PREF_MANUAL_BASE_URL = "manual_base_url"
+        private const val PREF_MIGRATED_BASE_URL = "manual_base_url_migrated_v1"
+        private const val LEGACY_BASE_URL_PREF_PREFIX = "overrideBaseUrl_v"
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
-        private const val BASE_URL_PREF_SUMMARY = "Override default domain with a different one"
     }
 }
