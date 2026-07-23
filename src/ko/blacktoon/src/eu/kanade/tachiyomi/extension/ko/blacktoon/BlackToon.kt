@@ -12,7 +12,12 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.BaseUrlCacheKeys
+import keiyoushi.utils.DynamicBaseUrlResolver
+import keiyoushi.utils.SharedPreferencesBaseUrlStorage
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.normalizeBaseUrl
+import keiyoushi.utils.rewriteBaseUrl
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
@@ -36,7 +41,6 @@ class BlackToon :
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
-    private val domainRefreshLock = Any()
     private var currentBaseUrlHost = ""
     override val baseUrl: String
         get() = getManualBaseUrl() ?: "https://blacktoon$domainNumber.com"
@@ -59,7 +63,7 @@ class BlackToon :
         val resolvedBaseUrl = when {
             !isManagedRequest -> null
             manualBaseUrl != null -> manualBaseUrl
-            else -> "https://${resolveBaseUrlHost()}".toHttpUrl()
+            else -> latestBaseUrlResolver.resolve().toHttpUrl()
         }
 
         if (resolvedBaseUrl != null) {
@@ -67,21 +71,20 @@ class BlackToon :
         }
         val requestHeaderBaseUrl = resolvedBaseUrl ?: if (originalRequest.url.host == cdnHost) {
             getManualBaseUrl()?.toHttpUrl()
-                ?: "https://${currentBaseUrlHost.ifBlank { getCachedLatestDomainHost() ?: domainHost(domainNumber) }}".toHttpUrl()
+                ?: latestBaseUrlResolver.cachedBaseUrl()?.toHttpUrl()
+                ?: "https://${currentBaseUrlHost.ifBlank { domainHost(domainNumber) }}".toHttpUrl()
         } else {
             null
         }
 
-        val request = originalRequest.newBuilder().apply {
-            if (resolvedBaseUrl != null) {
-                url(
-                    originalRequest.url.newBuilder()
-                        .scheme(resolvedBaseUrl.scheme)
-                        .host(resolvedBaseUrl.host)
-                        .port(resolvedBaseUrl.port)
-                        .build(),
-                )
+        val rewrittenRequest = if (resolvedBaseUrl != null) {
+            originalRequest.rewriteBaseUrl(resolvedBaseUrl.toString()) { host ->
+                host.matches(domainHostRegex) || host == manualBaseUrl?.host
             }
+        } else {
+            originalRequest
+        }
+        val request = rewrittenRequest.newBuilder().apply {
             if (requestHeaderBaseUrl != null) {
                 header("Referer", requestHeaderBaseUrl.toString())
                 header("Origin", requestHeaderBaseUrl.toString().trimEnd('/'))
@@ -99,6 +102,34 @@ class BlackToon :
         .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
+
+    private val latestBaseUrlResolver by lazy {
+        migrateLegacyDomainCache()
+        DynamicBaseUrlResolver(
+            storage = SharedPreferencesBaseUrlStorage(preferences),
+            keys = BaseUrlCacheKeys(
+                cachedUrl = LATEST_DOMAIN_URL_PREF,
+                fetchedAt = LATEST_DOMAIN_FETCHED_AT_PREF,
+                attemptedAt = LATEST_DOMAIN_ATTEMPTED_AT_PREF,
+            ),
+            fallbackBaseUrl = { "https://${currentBaseUrlHost.ifBlank { domainHost(domainNumber) }}" },
+            isAllowedAutomaticUrl = { it.host.matches(domainHostRegex) },
+            discoverBaseUrl = ::fetchLatestBaseUrl,
+            redirectBaseUrl = ::resolveRedirectBaseUrl,
+            onAutomaticUrlResolved = { resolvedBaseUrl ->
+                val host = resolvedBaseUrl.toHttpUrl().host
+                currentBaseUrlHost = host
+                updateDomainNumberFromHost(host)
+            },
+        )
+    }
+
+    private fun migrateLegacyDomainCache() {
+        if (preferences.getString(LATEST_DOMAIN_URL_PREF, null) != null) return
+        preferences.getString(LEGACY_LATEST_DOMAIN_HOST_PREF, null)
+            ?.takeIf { it.matches(domainHostRegex) }
+            ?.let { preferences.edit().putString(LATEST_DOMAIN_URL_PREF, "https://$it").apply() }
+    }
 
     private val json by injectLazy<Json>()
 
@@ -270,24 +301,11 @@ class BlackToon :
         .getString(PREF_MANUAL_BASE_URL, null)
         ?.let(::normalizeManualBaseUrl)
 
-    private fun normalizeManualBaseUrl(value: String): String? {
-        val url = value.trim().trimEnd('/').toHttpUrlOrNull() ?: return null
-        if (
-            url.scheme != "https" ||
-            url.port != 443 ||
-            url.encodedPath != "/" ||
-            url.query != null ||
-            url.username.isNotEmpty() ||
-            url.password.isNotEmpty()
-        ) {
-            return null
-        }
-        return url.newBuilder().encodedPath("/").build().toString().trimEnd('/')
-    }
+    private fun normalizeManualBaseUrl(value: String): String? = normalizeBaseUrl(value)
 
     private fun baseUrlPreferenceSummary(): String = getManualBaseUrl()
         ?.let { "현재 수동 주소: $it" }
-        ?: "현재 자동 주소: https://${getCachedLatestDomainHost() ?: domainHost(domainNumber)}\n" +
+        ?: "현재 자동 주소: ${latestBaseUrlResolver.cachedBaseUrl() ?: "https://${domainHost(domainNumber)}"}\n" +
         "비워두면 공식 안내 사이트에서 최신 주소를 자동 확인합니다."
 
     private var domainNumber = ""
@@ -314,11 +332,7 @@ class BlackToon :
         domainNumber = normalized
         if (resetCachedHost) {
             currentBaseUrlHost = ""
-            preferences.edit()
-                .remove(LATEST_DOMAIN_HOST_PREF)
-                .remove(LATEST_DOMAIN_FETCHED_AT_PREF)
-                .remove(LATEST_DOMAIN_ATTEMPTED_AT_PREF)
-                .apply()
+            latestBaseUrlResolver.clearCache()
         }
     }
 
@@ -329,66 +343,7 @@ class BlackToon :
         }
     }
 
-    private fun resolveBaseUrlHost(): String {
-        val now = System.currentTimeMillis()
-        val cachedHost = getCachedLatestDomainHost()
-        val fetchedAt = preferences.getLong(LATEST_DOMAIN_FETCHED_AT_PREF, 0L)
-        if (cachedHost != null && now - fetchedAt < DOMAIN_CACHE_DURATION_MS) {
-            currentBaseUrlHost = cachedHost
-            return cachedHost
-        }
-
-        val attemptedAt = preferences.getLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, 0L)
-        if (now - attemptedAt < DOMAIN_RETRY_DELAY_MS) {
-            return cachedHost ?: currentBaseUrlHost.ifBlank {
-                resolveRedirectDomainHost() ?: domainHost(domainNumber)
-            }
-        }
-
-        return synchronized(domainRefreshLock) {
-            val synchronizedNow = System.currentTimeMillis()
-            val synchronizedCachedHost = getCachedLatestDomainHost()
-            val synchronizedFetchedAt = preferences.getLong(LATEST_DOMAIN_FETCHED_AT_PREF, 0L)
-            if (
-                synchronizedCachedHost != null &&
-                synchronizedNow - synchronizedFetchedAt < DOMAIN_CACHE_DURATION_MS
-            ) {
-                currentBaseUrlHost = synchronizedCachedHost
-                return@synchronized synchronizedCachedHost
-            }
-
-            val synchronizedAttemptedAt = preferences.getLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, 0L)
-            if (synchronizedNow - synchronizedAttemptedAt < DOMAIN_RETRY_DELAY_MS) {
-                return@synchronized synchronizedCachedHost
-                    ?: currentBaseUrlHost.ifBlank {
-                        resolveRedirectDomainHost() ?: domainHost(domainNumber)
-                    }
-            }
-
-            preferences.edit()
-                .putLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, synchronizedNow)
-                .apply()
-
-            val discoveredHost = fetchLatestDomainHost() ?: resolveRedirectDomainHost()
-            val resolvedHost = discoveredHost
-                ?: synchronizedCachedHost
-                ?: currentBaseUrlHost.ifBlank { domainHost(domainNumber) }
-
-            currentBaseUrlHost = resolvedHost
-            updateDomainNumberFromHost(resolvedHost)
-
-            if (discoveredHost != null) {
-                preferences.edit()
-                    .putString(LATEST_DOMAIN_HOST_PREF, discoveredHost)
-                    .putLong(LATEST_DOMAIN_FETCHED_AT_PREF, synchronizedNow)
-                    .apply()
-            }
-
-            resolvedHost
-        }
-    }
-
-    private fun fetchLatestDomainHost(): String? = runCatching {
+    private fun fetchLatestBaseUrl(): String? = runCatching {
         domainLookupClient.newCall(
             GET(
                 LATEST_DOMAIN_ENDPOINT,
@@ -406,21 +361,22 @@ class BlackToon :
                 .asSequence()
                 .mapNotNull { it.attr("href").toHttpUrlOrNull() }
                 .firstOrNull { url -> isValidDiscoveredDomain(url) }
-                ?.host
+                ?.toString()
+                ?.trimEnd('/')
         }
     }.getOrNull()
 
-    private fun getCachedLatestDomainHost(): String? = preferences
-        .getString(LATEST_DOMAIN_HOST_PREF, null)
-        ?.takeIf { it.matches(domainHostRegex) }
-
-    private fun resolveRedirectDomainHost(): String? = runCatching {
-        noRedirectClient.newCall(GET(baseUrl, headers)).execute().use { response ->
+    private fun resolveRedirectBaseUrl(): String? = runCatching {
+        noRedirectClient.newCall(GET("https://${domainHost(domainNumber)}", headers)).execute().use { response ->
             response.headers["location"]
                 ?.toHttpUrlOrNull()
                 ?.takeIf(::isValidDiscoveredDomain)
-                ?.host
-                ?: response.request.url.host.takeIf { it.matches(domainHostRegex) }
+                ?.toString()
+                ?.trimEnd('/')
+                ?: response.request.url
+                    .takeIf(::isValidDiscoveredDomain)
+                    ?.toString()
+                    ?.trimEnd('/')
         }
     }.getOrNull()
 
@@ -450,12 +406,11 @@ class BlackToon :
         private const val PREF_MANUAL_BASE_URL = "manual_base_url"
         private const val DEFAULT_DOMAIN_NUMBER = "416"
         private const val LATEST_DOMAIN_ENDPOINT = "https://blacktoonurl.net/"
-        private const val LATEST_DOMAIN_HOST_PREF = "latest_domain_host"
+        private const val LATEST_DOMAIN_URL_PREF = "latest_domain_url"
+        private const val LEGACY_LATEST_DOMAIN_HOST_PREF = "latest_domain_host"
         private const val LATEST_DOMAIN_FETCHED_AT_PREF = "latest_domain_fetched_at"
         private const val LATEST_DOMAIN_ATTEMPTED_AT_PREF = "latest_domain_attempted_at"
         private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
-        private const val DOMAIN_CACHE_DURATION_MS = 12 * 60 * 60 * 1000L
-        private const val DOMAIN_RETRY_DELAY_MS = 15 * 60 * 1000L
         private val dbCacheLock = Any()
         private var cachedDb: List<SeriesItem>? = null
         private val dataScriptRegex = Regex("""loadScript\((?:inc_url\+)?['"](/data/webtoon/webtoon_\d+_\d+\.js)""")
