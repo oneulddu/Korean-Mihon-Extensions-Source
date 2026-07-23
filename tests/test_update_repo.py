@@ -155,6 +155,37 @@ class UpdateRepoTest(unittest.TestCase):
             source = index["extensions"][0]["sources"][0]
             self.assertEqual("https://fallback.example.com", source["homeUrl"])
 
+    def test_prunes_extension_removed_from_source_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            source_dir = work_dir / "source"
+            deploy_dir = work_dir / "deploy"
+            (deploy_dir / "apk").mkdir(parents=True)
+            (deploy_dir / "icon").mkdir()
+            self._prepare_source(source_dir)
+
+            stale_package = "eu.kanade.tachiyomi.extension.ko.removed"
+            stale_apk = "tachiyomi-ko.removed-v1.4.1-release.apk"
+            (deploy_dir / "index.min.json").write_text(
+                json.dumps([{"name": "Removed", "pkg": stale_package, "apk": stale_apk}]),
+                encoding="utf-8",
+            )
+            (deploy_dir / "index.json").write_text(
+                json.dumps({"extensions": [{"name": "Removed", "packageName": stale_package}]}),
+                encoding="utf-8",
+            )
+            (deploy_dir / "apk" / stale_apk).write_bytes(b"stale apk")
+            (deploy_dir / "icon" / f"{stale_package}.png").write_bytes(b"stale icon")
+
+            self._run_update(source_dir, deploy_dir)
+
+            legacy = json.loads((deploy_dir / "index.min.json").read_text(encoding="utf-8"))
+            modern = json.loads((deploy_dir / "index.json").read_text(encoding="utf-8"))
+            self.assertNotIn(stale_package, {entry["pkg"] for entry in legacy})
+            self.assertNotIn(stale_package, {entry["packageName"] for entry in modern["extensions"]})
+            self.assertFalse((deploy_dir / "apk" / stale_apk).exists())
+            self.assertFalse((deploy_dir / "icon" / f"{stale_package}.png").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

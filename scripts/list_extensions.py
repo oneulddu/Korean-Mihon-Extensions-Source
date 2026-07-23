@@ -16,6 +16,7 @@ SHARED_PATH_PREFIXES = (
     "gradle/",
     "lib/",
     "lib-multisrc/",
+    "scripts/",
 )
 
 SHARED_PATHS = {

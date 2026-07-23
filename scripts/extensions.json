@@ -25,12 +25,12 @@
     },
     "toon11": {
       "sources": [
-        { "name": "11toon", "lang": "ko", "baseUrl": "https://www.11toon.com" }
+        { "name": "11toon", "lang": "ko", "baseUrl": "https://www.spotv148.com" }
       ]
     },
     "toonkor": {
       "sources": [
-        { "name": "Toonkor", "lang": "ko", "baseUrl": "https://tkor136.com" }
+        { "name": "Toonkor", "lang": "ko", "baseUrl": "https://tkor137.com" }
       ]
     },
     "wolfdotcom": {

@@ -263,6 +263,34 @@ def read_existing_modern(deploy_dir: Path) -> dict[str, dict[str, Any]]:
     return {entry["packageName"]: entry for entry in entries if isinstance(entry, dict) and "packageName" in entry}
 
 
+def managed_package_names(modules: dict[str, tuple[str, Path, str]], config: dict[str, Any]) -> set[str]:
+    packages = set()
+    for module, (lang, _, _) in modules.items():
+        ext_config = config.get("extensions", {}).get(module, {})
+        packages.add(str(ext_config.get("packageName") or f"eu.kanade.tachiyomi.extension.{lang}.{module}"))
+    return packages
+
+
+def prune_missing_extensions(
+    deploy_dir: Path,
+    legacy_entries: dict[str, dict[str, Any]],
+    modern_entries: dict[str, dict[str, Any]],
+    known_packages: set[str],
+) -> None:
+    managed_prefix = "eu.kanade.tachiyomi.extension."
+    stale_packages = {
+        package
+        for package in legacy_entries.keys() | modern_entries.keys()
+        if package.startswith(managed_prefix) and package not in known_packages
+    }
+    for package in stale_packages:
+        legacy = legacy_entries.pop(package, None)
+        modern_entries.pop(package, None)
+        if legacy and isinstance(legacy.get("apk"), str):
+            (deploy_dir / "apk" / legacy["apk"]).unlink(missing_ok=True)
+        (deploy_dir / "icon" / f"{package}.png").unlink(missing_ok=True)
+
+
 def build_deploy_readme_table(modern_index: dict[str, Any]) -> str:
     lines = [
         "| 확장 | 버전 | 사이트 | 패키지 |",
@@ -305,6 +333,13 @@ def main() -> None:
 
     legacy_entries = {} if args.replace else read_existing_legacy(deploy_dir)
     modern_entries = {} if args.replace else read_existing_modern(deploy_dir)
+    if not args.replace:
+        prune_missing_extensions(
+            deploy_dir,
+            legacy_entries,
+            modern_entries,
+            managed_package_names(modules, config),
+        )
 
     for info in infos:
         apk_name = info.apk_path.name
