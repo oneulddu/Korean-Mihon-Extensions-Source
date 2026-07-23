@@ -19,15 +19,16 @@ import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
 import rx.Observable
-import java.io.IOException
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 open class Wolf(
     name: String,
@@ -53,6 +54,11 @@ open class Wolf(
         .build()
 
     private val preference: SharedPreferences by getPreferencesLazy()
+
+    private val domainLookupClient = network.client.newBuilder()
+        .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .build()
 
     override fun fetchPopularManga(page: Int): Observable<MangasPage> = fetchSearchManga(page, "", FilterList(SortFilter(1)))
 
@@ -183,7 +189,7 @@ open class Wolf(
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
 
-        return document.select("a.ep-item[href*=$readerPath]").mapNotNull { el ->
+        val chapters = document.select("a.ep-item[href*=$readerPath]").mapNotNull { el ->
             val chapUrl = el.absUrl("href").toHttpUrl()
             val toon = chapUrl.queryParameter("toon") ?: return@mapNotNull null
             val num = chapUrl.queryParameter("num") ?: return@mapNotNull null
@@ -195,6 +201,24 @@ open class Wolf(
                 name = el.selectFirst(".ep-title")?.text()?.trim().orEmpty()
                 chapter_number = num.toFloatOrNull() ?: -1f
                 date_upload = dateFormat.tryParse(el.selectFirst(".ep-date")?.text())
+            }
+        }
+
+        if (chapters.isEmpty()) return chapters
+
+        val maxChapterNumber = chapters.maxOf { it.chapter_number.toInt() }
+        if (maxChapterNumber <= chapters.size || maxChapterNumber > MAX_SYNTHETIC_CHAPTERS) {
+            return chapters
+        }
+
+        val toon = response.request.url.queryParameter("toon") ?: return chapters
+        val chaptersByNumber = chapters.associateBy { it.chapter_number.toInt() }
+
+        return (maxChapterNumber downTo 1).map { number ->
+            chaptersByNumber[number] ?: SChapter.create().apply {
+                url = ChapterUrl(toon, number.toString()).toJsonString()
+                name = "회차 $number"
+                chapter_number = number.toFloat()
             }
         }
     }
@@ -225,12 +249,18 @@ open class Wolf(
         EditTextPreference(screen.context).apply {
             key = PREF_DOMAIN_NUM
             title = "도메인 번호"
+            summary = "최신 주소를 a14c.com에서 자동 확인합니다.\n현재 도메인 번호: $domainNumber"
             setOnPreferenceChangeListener { _, newValue ->
                 val value = newValue as String
                 if (value.isEmpty() || value.toIntOrNull() == null) {
                     false
                 } else {
                     domainNumber = value.trim()
+                    preference.edit()
+                        .remove(PREF_LATEST_DOMAIN_NUM)
+                        .remove(PREF_LATEST_DOMAIN_FETCHED_AT)
+                        .remove(PREF_LATEST_DOMAIN_ATTEMPTED_AT)
+                        .apply()
                     false
                 }
             }
@@ -270,37 +300,104 @@ open class Wolf(
 
     private fun domainNumberInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        val response = chain.proceed(request)
+        if (!request.url.host.matches(domainHostRegex)) return chain.proceed(request)
 
-        val url = request.url.toString()
-
-        if (url.contains(domainRegex)) {
-            val document = Jsoup.parse(response.peekBody(Long.MAX_VALUE).string())
-            val newUrl = document.selectFirst("""#pop-content a[href~=^https?://wfwf\d+\.com]""")
-                ?: return response
-
-            response.close()
-
-            val newDomainNum = domainRegex.find(newUrl.attr("href"))?.groupValues?.get(1)
-                ?: throw IOException("Failed to update domain number")
-
-            domainNumber = newDomainNum.trim()
-
-            return chain.proceed(
-                request.newBuilder()
-                    .url(
-                        request.url.newBuilder()
-                            .host(baseUrl.toHttpUrl().host)
-                            .build(),
-                    )
-                    .build(),
-            )
+        val latestDomainNumber = resolveLatestDomainNumber()
+        val latestHost = domainHost(latestDomainNumber)
+        val rewrittenRequest = if (request.url.host == latestHost) {
+            request
+        } else {
+            request.newBuilder()
+                .url(request.url.newBuilder().host(latestHost).build())
+                .build()
         }
 
-        return response
+        return chain.proceed(rewrittenRequest)
     }
 
-    private val domainRegex = Regex("""^https?://wfwf(\d+)\.com""")
+    private fun resolveLatestDomainNumber(): String {
+        val now = System.currentTimeMillis()
+        val cachedDomainNumber = getCachedLatestDomainNumber()
+        val fetchedAt = preference.getLong(PREF_LATEST_DOMAIN_FETCHED_AT, 0L)
+        if (cachedDomainNumber != null && now - fetchedAt < DOMAIN_CACHE_DURATION_MS) {
+            domainNumber = cachedDomainNumber
+            return cachedDomainNumber
+        }
+
+        val attemptedAt = preference.getLong(PREF_LATEST_DOMAIN_ATTEMPTED_AT, 0L)
+        if (now - attemptedAt < DOMAIN_RETRY_DELAY_MS) return cachedDomainNumber ?: domainNumber
+
+        return synchronized(domainRefreshLock) {
+            val synchronizedNow = System.currentTimeMillis()
+            val synchronizedCachedDomainNumber = getCachedLatestDomainNumber()
+            val synchronizedFetchedAt = preference.getLong(PREF_LATEST_DOMAIN_FETCHED_AT, 0L)
+            if (
+                synchronizedCachedDomainNumber != null &&
+                synchronizedNow - synchronizedFetchedAt < DOMAIN_CACHE_DURATION_MS
+            ) {
+                domainNumber = synchronizedCachedDomainNumber
+                return@synchronized synchronizedCachedDomainNumber
+            }
+
+            val synchronizedAttemptedAt = preference.getLong(PREF_LATEST_DOMAIN_ATTEMPTED_AT, 0L)
+            if (synchronizedNow - synchronizedAttemptedAt < DOMAIN_RETRY_DELAY_MS) {
+                return@synchronized synchronizedCachedDomainNumber ?: domainNumber
+            }
+
+            preference.edit()
+                .putLong(PREF_LATEST_DOMAIN_ATTEMPTED_AT, synchronizedNow)
+                .apply()
+
+            val fetchedDomainNumber = fetchLatestDomainNumber()
+            val resolvedDomainNumber = fetchedDomainNumber ?: synchronizedCachedDomainNumber ?: domainNumber
+            domainNumber = resolvedDomainNumber
+
+            if (fetchedDomainNumber != null) {
+                preference.edit()
+                    .putString(PREF_LATEST_DOMAIN_NUM, fetchedDomainNumber)
+                    .putLong(PREF_LATEST_DOMAIN_FETCHED_AT, synchronizedNow)
+                    .apply()
+            }
+
+            resolvedDomainNumber
+        }
+    }
+
+    private fun fetchLatestDomainNumber(): String? = runCatching {
+        domainLookupClient.newCall(
+            GET(
+                LATEST_DOMAIN_ENDPOINT,
+                headersBuilder()
+                    .set("Accept", "text/html,application/xhtml+xml")
+                    .set("Cache-Control", "no-cache")
+                    .build(),
+            ),
+        ).execute().use { response ->
+            if (!response.isSuccessful) return@use null
+
+            response.asJsoup()
+                .select("a[href]")
+                .asSequence()
+                .mapNotNull { it.attr("href").toHttpUrlOrNull() }
+                .firstOrNull(::isValidDiscoveredDomain)
+                ?.host
+                ?.let { domainNumberRegex.matchEntire(it)?.groupValues?.get(1) }
+        }
+    }.getOrNull()
+
+    private fun getCachedLatestDomainNumber(): String? = preference
+        .getString(PREF_LATEST_DOMAIN_NUM, null)
+        ?.takeIf { domainHost(it).matches(domainHostRegex) }
+
+    private fun isValidDiscoveredDomain(url: okhttp3.HttpUrl): Boolean = url.scheme == "https" &&
+        url.host.matches(domainHostRegex) &&
+        url.port == 443 &&
+        url.encodedPath == "/" &&
+        url.query == null &&
+        url.username.isEmpty() &&
+        url.password.isEmpty()
+
+    private fun domainHost(number: String) = "wfwf$number.com"
 
     private fun refererInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request().newBuilder()
@@ -316,7 +413,21 @@ open class Wolf(
     override fun latestUpdatesParse(response: Response): MangasPage = throw UnsupportedOperationException()
     override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
     override fun searchMangaParse(response: Response): MangasPage = throw UnsupportedOperationException()
+
+    companion object {
+        private const val MAX_SYNTHETIC_CHAPTERS = 5_000
+        private val domainRefreshLock = Any()
+        private val domainHostRegex = Regex("""^wfwf\d+\.com$""")
+        private val domainNumberRegex = Regex("""^wfwf(\d+)\.com$""")
+    }
 }
 
 private const val PREF_DOMAIN_NUM = "domain_number"
 private const val PREF_DOMAIN_NUM_DEFAULT = "domain_number_default"
+private const val PREF_LATEST_DOMAIN_NUM = "latest_domain_number"
+private const val PREF_LATEST_DOMAIN_FETCHED_AT = "latest_domain_fetched_at"
+private const val PREF_LATEST_DOMAIN_ATTEMPTED_AT = "latest_domain_attempted_at"
+private const val LATEST_DOMAIN_ENDPOINT = "https://a14c.com/"
+private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
+private const val DOMAIN_CACHE_DURATION_MS = 12 * 60 * 60 * 1000L
+private const val DOMAIN_RETRY_DELAY_MS = 15 * 60 * 1000L
