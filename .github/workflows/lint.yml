@@ -43,26 +43,28 @@ concurrency:
 jobs:
   python-scripts:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Check Python scripts
         run: |
-          python3 -m py_compile scripts/list_extensions.py scripts/update_repo.py tests/test_update_repo.py
-          python3 -m unittest tests.test_update_repo
+          python3 -m compileall -q scripts tests
+          python3 -m unittest discover -s tests -v
 
   spotless:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up JDK
         uses: actions/setup-java@v5
@@ -76,6 +78,4 @@ jobs:
           cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
 
       - name: Run Spotless
-        run: |
-          chmod +x ./gradlew
-          ./gradlew --no-daemon spotlessCheck
+        run: ./gradlew --no-daemon spotlessCheck
