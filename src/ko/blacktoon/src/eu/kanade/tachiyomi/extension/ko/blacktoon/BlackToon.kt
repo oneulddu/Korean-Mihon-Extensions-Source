@@ -42,6 +42,7 @@ class BlackToon :
         get() = getManualBaseUrl() ?: "https://blacktoon$domainNumber.com"
 
     private val cdnUrl = "https://aa3cc9.speedwebgo.com/"
+    private val cdnHost = cdnUrl.toHttpUrl().host
 
     override val supportsLatest = true
 
@@ -64,6 +65,12 @@ class BlackToon :
         if (resolvedBaseUrl != null) {
             currentBaseUrlHost = resolvedBaseUrl.host
         }
+        val requestHeaderBaseUrl = resolvedBaseUrl ?: if (originalRequest.url.host == cdnHost) {
+            getManualBaseUrl()?.toHttpUrl()
+                ?: "https://${currentBaseUrlHost.ifBlank { getCachedLatestDomainHost() ?: domainHost(domainNumber) }}".toHttpUrl()
+        } else {
+            null
+        }
 
         val request = originalRequest.newBuilder().apply {
             if (resolvedBaseUrl != null) {
@@ -74,8 +81,10 @@ class BlackToon :
                         .port(resolvedBaseUrl.port)
                         .build(),
                 )
-                header("Referer", "$resolvedBaseUrl")
-                header("Origin", resolvedBaseUrl.toString().trimEnd('/'))
+            }
+            if (requestHeaderBaseUrl != null) {
+                header("Referer", requestHeaderBaseUrl.toString())
+                header("Origin", requestHeaderBaseUrl.toString().trimEnd('/'))
             }
         }.build()
 
@@ -93,7 +102,9 @@ class BlackToon :
 
     private val json by injectLazy<Json>()
 
-    private val db by lazy {
+    private val db by lazy { synchronized(dbCacheLock) { cachedDb ?: loadDb().also { cachedDb = it } } }
+
+    private fun loadDb(): List<SeriesItem> {
         val response = client.newCall(GET(baseUrl, headers)).execute()
         val body = response.body.string()
         val dataScriptUrls = dataScriptRegex.findAll(body)
@@ -102,7 +113,7 @@ class BlackToon :
             .toList()
             .ifEmpty { throw IOException("unable to find webtoon data scripts") }
 
-        dataScriptUrls.flatMap { scriptUrl ->
+        return dataScriptUrls.flatMap { scriptUrl ->
             var listIdx: Int
             client.newCall(GET("$baseUrl$scriptUrl", headers))
                 .execute().body.string()
@@ -445,6 +456,8 @@ class BlackToon :
         private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
         private const val DOMAIN_CACHE_DURATION_MS = 12 * 60 * 60 * 1000L
         private const val DOMAIN_RETRY_DELAY_MS = 15 * 60 * 1000L
+        private val dbCacheLock = Any()
+        private var cachedDb: List<SeriesItem>? = null
         private val dataScriptRegex = Regex("""loadScript\((?:inc_url\+)?['"](/data/webtoon/webtoon_\d+_\d+\.js)""")
         private val domainRegex = Regex("""blacktoon(\d+)\.com""")
         private val domainHostRegex = Regex("""^blacktoon\d+\.com$""")
