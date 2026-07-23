@@ -15,14 +15,18 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.BaseUrlCacheKeys
+import keiyoushi.utils.DynamicBaseUrlResolver
+import keiyoushi.utils.SharedPreferencesBaseUrlStorage
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.normalizeBaseUrl
+import keiyoushi.utils.rewriteBaseUrl
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
@@ -53,8 +57,6 @@ class Jjaptoon :
     override val supportsLatest = true
 
     private val preferences: SharedPreferences by getPreferencesLazy()
-    private val domainRefreshLock = Any()
-
     private val domainLookupClient by lazy {
         network.client.newBuilder()
             .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
@@ -68,6 +70,21 @@ class Jjaptoon :
             .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .build()
+    }
+
+    private val latestBaseUrlResolver by lazy {
+        DynamicBaseUrlResolver(
+            storage = SharedPreferencesBaseUrlStorage(preferences),
+            keys = BaseUrlCacheKeys(
+                cachedUrl = LATEST_DOMAIN_URL_PREF,
+                fetchedAt = LATEST_DOMAIN_FETCHED_AT_PREF,
+                attemptedAt = LATEST_DOMAIN_ATTEMPTED_AT_PREF,
+            ),
+            fallbackBaseUrl = { fallbackBaseUrl },
+            isAllowedAutomaticUrl = { it.host.matches(JJAPTOON_HOST_REGEX) },
+            discoverBaseUrl = ::fetchLatestBaseUrl,
+            redirectBaseUrl = ::resolveRedirectBaseUrl,
+        )
     }
 
     private val latestDomainInterceptor = Interceptor { chain ->
@@ -458,74 +475,7 @@ class Jjaptoon :
             return request
         }
 
-        val latestBaseUrl = resolveLatestBaseUrl().toHttpUrl()
-        if (
-            request.url.scheme == latestBaseUrl.scheme &&
-            request.url.host == latestBaseUrl.host &&
-            request.url.port == latestBaseUrl.port
-        ) {
-            return request
-        }
-
-        val rewrittenUrl = request.url.newBuilder()
-            .scheme(latestBaseUrl.scheme)
-            .host(latestBaseUrl.host)
-            .port(latestBaseUrl.port)
-            .build()
-        val builder = request.newBuilder().url(rewrittenUrl)
-        request.header("Referer")
-            ?.toHttpUrlOrNull()
-            ?.takeIf { it.host.matches(JJAPTOON_HOST_REGEX) }
-            ?.let { referer ->
-                builder.header(
-                    "Referer",
-                    referer.newBuilder()
-                        .scheme(latestBaseUrl.scheme)
-                        .host(latestBaseUrl.host)
-                        .port(latestBaseUrl.port)
-                        .build()
-                        .toString(),
-                )
-            }
-        return builder.build()
-    }
-
-    private fun resolveLatestBaseUrl(): String {
-        val now = System.currentTimeMillis()
-        val cached = getCachedLatestBaseUrl()
-        val fetchedAt = preferences.getLong(LATEST_DOMAIN_FETCHED_AT_PREF, 0L)
-        if (cached != null && now - fetchedAt < DOMAIN_CACHE_DURATION_MS) return cached
-
-        val attemptedAt = preferences.getLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, 0L)
-        if (now - attemptedAt < DOMAIN_RETRY_DELAY_MS) return cached ?: fallbackBaseUrl
-
-        return synchronized(domainRefreshLock) {
-            val synchronizedNow = System.currentTimeMillis()
-            val synchronizedCached = getCachedLatestBaseUrl()
-            val synchronizedFetchedAt = preferences.getLong(LATEST_DOMAIN_FETCHED_AT_PREF, 0L)
-            if (
-                synchronizedCached != null &&
-                synchronizedNow - synchronizedFetchedAt < DOMAIN_CACHE_DURATION_MS
-            ) {
-                return@synchronized synchronizedCached
-            }
-
-            val synchronizedAttemptedAt = preferences.getLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, 0L)
-            if (synchronizedNow - synchronizedAttemptedAt < DOMAIN_RETRY_DELAY_MS) {
-                return@synchronized synchronizedCached ?: fallbackBaseUrl
-            }
-
-            preferences.edit()
-                .putLong(LATEST_DOMAIN_ATTEMPTED_AT_PREF, synchronizedNow)
-                .apply()
-            val discoveredBaseUrl = fetchLatestBaseUrl() ?: resolveRedirectBaseUrl()
-            discoveredBaseUrl?.also { latestBaseUrl ->
-                preferences.edit()
-                    .putString(LATEST_DOMAIN_URL_PREF, latestBaseUrl)
-                    .putLong(LATEST_DOMAIN_FETCHED_AT_PREF, synchronizedNow)
-                    .apply()
-            } ?: synchronizedCached ?: fallbackBaseUrl
-        }
+        return request.rewriteBaseUrl(latestBaseUrlResolver.resolve()) { it.matches(JJAPTOON_HOST_REGEX) }
     }
 
     private fun fetchLatestBaseUrl(): String? = runCatching {
@@ -540,50 +490,19 @@ class Jjaptoon :
         ).execute().use { response ->
             if (!response.isSuccessful) return@use null
             val data = json.decodeFromString<LatestDomainResponse>(response.body.string())
-            normalizeDiscoveredBaseUrl(data.domain)
+            data.domain
         }
     }.getOrNull()
 
     private fun resolveRedirectBaseUrl(): String? = runCatching {
         noRedirectClient.newCall(GET(fallbackBaseUrl)).execute().use { response ->
-            response.header("Location")?.let(::normalizeDiscoveredBaseUrl)
+            response.header("Location")
         }
     }.getOrNull()
 
-    private fun getCachedLatestBaseUrl(): String? = preferences
-        .getString(LATEST_DOMAIN_URL_PREF, null)
-        ?.let(::normalizeDiscoveredBaseUrl)
+    private fun getCachedLatestBaseUrl(): String? = latestBaseUrlResolver.cachedBaseUrl()
 
-    private fun normalizeDiscoveredBaseUrl(value: String): String? {
-        val url = value.trim().trimEnd('/').toHttpUrlOrNull() ?: return null
-        if (
-            url.scheme != "https" ||
-            !url.host.matches(JJAPTOON_HOST_REGEX) ||
-            url.port != 443 ||
-            url.encodedPath != "/" ||
-            url.query != null ||
-            url.username.isNotEmpty() ||
-            url.password.isNotEmpty()
-        ) {
-            return null
-        }
-        return url.newBuilder().encodedPath("/").build().toString().trimEnd('/')
-    }
-
-    private fun normalizeManualBaseUrl(value: String): String? {
-        val url = value.trim().trimEnd('/').toHttpUrlOrNull() ?: return null
-        if (
-            url.scheme != "https" ||
-            url.port != 443 ||
-            url.encodedPath != "/" ||
-            url.query != null ||
-            url.username.isNotEmpty() ||
-            url.password.isNotEmpty()
-        ) {
-            return null
-        }
-        return url.newBuilder().encodedPath("/").build().toString().trimEnd('/')
-    }
+    private fun normalizeManualBaseUrl(value: String): String? = normalizeBaseUrl(value)
 
     private fun baseUrlPreferenceSummary(): String = getManualBaseUrl()
         ?.let { "현재 수동 주소: $it" }
@@ -609,8 +528,6 @@ class Jjaptoon :
         private const val LATEST_DOMAIN_FETCHED_AT_PREF = "latest_domain_fetched_at"
         private const val LATEST_DOMAIN_ATTEMPTED_AT_PREF = "latest_domain_attempted_at"
         private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
-        private const val DOMAIN_CACHE_DURATION_MS = 12 * 60 * 60 * 1000L
-        private const val DOMAIN_RETRY_DELAY_MS = 15 * 60 * 1000L
         private const val FILTER_ALL = "all"
         private const val SORT_LATEST = "latest"
         private const val SORT_POPULAR = "popular"
