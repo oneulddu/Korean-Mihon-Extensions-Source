@@ -79,7 +79,14 @@ abstract class NaverComicBase(protected val mType: String) : HttpSource() {
 
         var urls = document.select(".wt_viewer img").map { it.attr("abs:src").ifEmpty { it.attr("src") } }
         if (urls.isEmpty()) {
-            urls = document.select(".toon_view_lst img").map { it.attr("abs:data-src").ifEmpty { it.attr("data-src") } }
+            urls = document.select(".toon_view_lst img.toon_image").map {
+                it.attr("abs:data-src").ifEmpty { it.attr("abs:src") }
+            }
+        }
+        if (urls.isEmpty()) {
+            urls = document.select(".cut_flick_wrap img.swiper-lazy").map {
+                it.attr("abs:data-src").ifEmpty { it.attr("abs:src") }
+            }
         }
 
         return urls.mapIndexed { index, url -> Page(index, imageUrl = url) }

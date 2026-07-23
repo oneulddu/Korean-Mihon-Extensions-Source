@@ -38,9 +38,6 @@ class Toonkor :
 
     override val supportsLatest = true
 
-    private val webtoonsRequestPath = "/%EC%9B%B9%ED%88%B0"
-    private val latestRequestModifier = "?fil=%EC%B5%9C%EC%8B%A0"
-
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
 
     private val pageListRegex = Regex("""src="([^"]*)"""")
@@ -49,7 +46,7 @@ class Toonkor :
 
     // Popular
 
-    override fun popularMangaRequest(page: Int): Request = GET(baseUrl + webtoonsRequestPath, headers)
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl$WEBTOONS_PATH$ALL_STATUS_PATH$SORT_POPULAR", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
@@ -68,7 +65,7 @@ class Toonkor :
 
     // Latest
 
-    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl + webtoonsRequestPath + latestRequestModifier, headers)
+    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl$WEBTOONS_PATH$ALL_STATUS_PATH$SORT_LATEST", headers)
 
     override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
 
@@ -78,13 +75,12 @@ class Toonkor :
         val filterList = if (filters.isEmpty()) getFilterList() else filters
 
         val type = filterList.firstInstanceOrNull<TypeFilter>()
+        val status = filterList.firstInstanceOrNull<StatusFilter>()
         val sort = filterList.firstInstanceOrNull<SortFilter>()
 
-        // Hentai doesn't have a "completed" sort, ignore it if it's selected (equivalent to returning popular)
         val requestPath = when {
             query.isNotBlank() -> "/bbs/search.php?sfl=wr_subject%7C%7Cwr_content&stx=$query"
-            type?.isSelection("Hentai") == true && sort?.isSelection("Completed") == true -> type.toUriPart()
-            else -> (type?.toUriPart() ?: "") + (sort?.toUriPart() ?: "")
+            else -> "${type?.toUriPart() ?: ""}${status?.toUriPart() ?: ""}${sort?.toUriPart() ?: ""}"
         }
 
         return GET(baseUrl + requestPath, headers)
@@ -144,6 +140,7 @@ class Toonkor :
         Filter.Header("Note: can't combine with text search!"),
         Filter.Separator(),
         TypeFilter(),
+        StatusFilter(),
         SortFilter(),
     )
 
