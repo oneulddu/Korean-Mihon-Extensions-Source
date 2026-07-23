@@ -1,7 +1,7 @@
 ext {
     extName = 'Wolf.com'
     extClass = '.WolfFactory'
-    extVersionCode = 6
+    extVersionCode = 7
     isNsfw = true
 }
 
@@ -14,7 +14,7 @@ androidComponents {
             def variantName = variant.name.capitalize()
 
             def task = tasks.register("update${variantName}DomainNumber", UpdateDomainNumberTask) {
-                defaultDomainNumber.set(421)
+                defaultDomainNumber.set(425)
 
                 outputs.upToDateWhen { false }
             }
@@ -36,7 +36,7 @@ abstract class UpdateDomainNumberTask extends DefaultTask {
     void action() {
         def domainNumber = defaultDomainNumber.get()
         try {
-            def response = new URL("https://nicelink52.com/").text
+            def response = new URL("https://a14c.com/").text
             def matcher = response =~ ~/https?:\/\/wfwf(\d+)\.com/
             if (matcher) {
                 domainNumber = matcher[0][1]
