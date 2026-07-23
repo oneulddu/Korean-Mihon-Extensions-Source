@@ -43,7 +43,7 @@ class SeriesItem(
         url = id
         title = name
         thumbnail_url = poster.takeIf { it.isNotBlank() }?.let {
-            cdnUrl + it
+            cdnUrl + it.replace("_x4", "").replace("_x3", "")
         }
         genre = buildList {
             add(platformsMap[platform])
