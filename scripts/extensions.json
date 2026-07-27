@@ -42,7 +42,7 @@
     },
     "xtoon": {
       "sources": [
-        { "name": "Xtoon", "lang": "ko", "baseUrl": "https://t3.xtoon365.com" }
+        { "name": "Xtoon", "lang": "ko", "baseUrl": "https://t4.xtoon365.com" }
       ]
     }
   }
