@@ -78,4 +78,4 @@ jobs:
           cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
 
       - name: Run Spotless
-        run: ./gradlew --no-daemon spotlessCheck
+        run: ./gradlew --no-daemon --no-parallel spotlessCheck

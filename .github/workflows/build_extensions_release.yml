@@ -97,7 +97,11 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           CI_SELECTED_EXTENSIONS: ${{ steps.tasks.outputs.selected_extensions }}
         run: |
-          ./gradlew --no-daemon ${{ steps.tasks.outputs.tasks }}
+          # Spotless format tasks share temporary cleanup state inside each module and can
+          # race when several formats run in parallel. Check formatting once serially,
+          # then keep the expensive Android compilation parallel without rerunning it.
+          ./gradlew --no-daemon --no-parallel spotlessCheck
+          ./gradlew --no-daemon ${{ steps.tasks.outputs.tasks }} -x spotlessCheck
 
       - name: Checkout deployment repository
         if: steps.tasks.outputs.should_build == 'true'
