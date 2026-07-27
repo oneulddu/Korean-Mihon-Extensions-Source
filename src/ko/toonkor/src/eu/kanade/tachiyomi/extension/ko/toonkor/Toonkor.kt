@@ -14,15 +14,23 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.BaseUrlCacheKeys
+import keiyoushi.utils.DynamicBaseUrlResolver
+import keiyoushi.utils.SharedPreferencesBaseUrlStorage
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.normalizeBaseUrl
+import keiyoushi.utils.rewriteBaseUrl
+import keiyoushi.utils.shouldInvalidateNumberedDomainCache
 import keiyoushi.utils.tryParse
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import java.nio.charset.Charset
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 class Toonkor :
     HttpSource(),
@@ -30,9 +38,10 @@ class Toonkor :
 
     override val name = "Toonkor"
 
-    private val defaultBaseUrl = "https://tkor137.com"
+    private val defaultBaseUrl = "https://tkor138.com"
 
-    override val baseUrl by lazy { getPrefBaseUrl() }
+    override val baseUrl: String
+        get() = getManualBaseUrl() ?: defaultBaseUrl
 
     override val lang = "ko"
 
@@ -43,6 +52,47 @@ class Toonkor :
     private val pageListRegex = Regex("""src="([^"]*)"""")
 
     private val preferences: SharedPreferences by getPreferencesLazy()
+
+    override val client = network.client.newBuilder()
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val manualBaseUrl = getManualBaseUrl()?.toHttpUrl()
+            val isAutomaticHost = request.url.host.matches(AUTOMATIC_HOST_REGEX)
+            val isManualHost = manualBaseUrl != null && request.url.host == manualBaseUrl.host
+            if (!isAutomaticHost && !isManualHost) return@addInterceptor chain.proceed(request)
+
+            val resolvedBaseUrl = manualBaseUrl?.toString() ?: latestBaseUrlResolver.resolve()
+            val rewrittenRequest = request.rewriteBaseUrl(resolvedBaseUrl) { host ->
+                host.matches(AUTOMATIC_HOST_REGEX) || host == manualBaseUrl?.host
+            }
+
+            chain.proceed(rewrittenRequest)
+        }
+        .build()
+
+    private val noRedirectClient = network.client.newBuilder()
+        .followRedirects(false)
+        .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .build()
+
+    private val latestBaseUrlResolver by lazy {
+        migrateAutomaticBaseUrlCache()
+        DynamicBaseUrlResolver(
+            storage = SharedPreferencesBaseUrlStorage(preferences),
+            keys = BaseUrlCacheKeys(
+                cachedUrl = PREF_LATEST_BASE_URL,
+                fetchedAt = PREF_LATEST_BASE_URL_FETCHED_AT,
+                attemptedAt = PREF_LATEST_BASE_URL_ATTEMPTED_AT,
+            ),
+            fallbackBaseUrl = { defaultBaseUrl },
+            isAllowedAutomaticUrl = ::isAllowedAutomaticUrl,
+            // Toonkor has no stable official address guide/API. The previous numbered
+            // domain's HTTP redirect is therefore the primary automatic recovery path.
+            discoverBaseUrl = { null },
+            redirectBaseUrl = ::resolveRedirectBaseUrl,
+        )
+    }
 
     // Popular
 
@@ -154,7 +204,7 @@ class Toonkor :
             summary = baseUrlPreferenceSummary()
             setDefaultValue("")
             dialogTitle = BASE_URL_PREF_TITLE
-            dialogMessage = "비워두면 기본 주소 $defaultBaseUrl 을 사용합니다."
+            dialogMessage = "비워두면 번호형 주소의 리다이렉트에서 최신 주소를 자동 확인합니다."
             setOnPreferenceChangeListener { preference, newValue ->
                 val value = (newValue as? String).orEmpty().trim()
                 if (value.isEmpty()) {
@@ -173,11 +223,10 @@ class Toonkor :
         }.also(screen::addPreference)
     }
 
-    private fun getPrefBaseUrl(): String {
+    private fun getManualBaseUrl(): String? {
         migrateLegacyBaseUrl()
         return preferences.getString(PREF_MANUAL_BASE_URL, null)
             ?.let(::normalizeBaseUrl)
-            ?: defaultBaseUrl
     }
 
     private fun migrateLegacyBaseUrl() {
@@ -195,17 +244,71 @@ class Toonkor :
     private fun baseUrlPreferenceSummary(): String = preferences.getString(PREF_MANUAL_BASE_URL, null)
         ?.let(::normalizeBaseUrl)
         ?.let { "현재 수동 주소: $it" }
-        ?: "현재 기본 주소: $defaultBaseUrl"
+        ?: "현재 자동 주소: ${latestBaseUrlResolver.cachedBaseUrl() ?: defaultBaseUrl}\n" +
+        "비워두면 번호형 주소의 리다이렉트에서 최신 주소를 자동 확인합니다."
+
+    private fun migrateAutomaticBaseUrlCache() {
+        if (preferences.getString(PREF_DEFAULT_BASE_URL, null) == defaultBaseUrl) return
+
+        val shouldInvalidateCache = shouldInvalidateNumberedDomainCache(
+            cachedBaseUrl = preferences.getString(PREF_LATEST_BASE_URL, null),
+            legacyDomainNumber = null,
+            minimumDomainNumber = DEFAULT_DOMAIN_NUMBER,
+            hostNumberRegex = AUTOMATIC_HOST_NUMBER_REGEX,
+        )
+        preferences.edit().apply {
+            putString(PREF_DEFAULT_BASE_URL, defaultBaseUrl)
+            if (shouldInvalidateCache) {
+                remove(PREF_LATEST_BASE_URL)
+                remove(PREF_LATEST_BASE_URL_FETCHED_AT)
+                remove(PREF_LATEST_BASE_URL_ATTEMPTED_AT)
+            }
+        }.apply()
+    }
+
+    private fun resolveRedirectBaseUrl(): String? = runCatching {
+        val probeBaseUrl = preferences.getString(PREF_LATEST_BASE_URL, null)
+            ?.let { normalizeBaseUrl(it, ::isAllowedAutomaticUrl) }
+            ?: defaultBaseUrl
+
+        noRedirectClient.newCall(GET(probeBaseUrl, headers)).execute().use { response ->
+            response.header("Location")
+                ?.let { response.request.url.resolve(it) }
+                ?.takeIf(::isValidAutomaticBaseUrl)
+                ?.toString()
+                ?.trimEnd('/')
+                ?: response.request.url
+                    .takeIf(::isValidAutomaticBaseUrl)
+                    ?.toString()
+                    ?.trimEnd('/')
+        }
+    }.getOrNull()
+
+    private fun isAllowedAutomaticUrl(url: HttpUrl): Boolean = url.host.matches(AUTOMATIC_HOST_REGEX)
+
+    private fun isValidAutomaticBaseUrl(url: HttpUrl): Boolean = normalizeBaseUrl(
+        url.toString(),
+        ::isAllowedAutomaticUrl,
+    ) != null
 
     companion object {
         private val oldDefaultBaseUrls = setOf(
             "https://tkor114.com",
             "https://tkor136.com",
+            "https://tkor137.com",
         )
 
+        private const val DEFAULT_DOMAIN_NUMBER = 138
+        private val AUTOMATIC_HOST_REGEX = Regex("""^tkor\d+\.com$""")
+        private val AUTOMATIC_HOST_NUMBER_REGEX = Regex("""^tkor(\d+)\.com$""")
         private const val PREF_MANUAL_BASE_URL = "manual_base_url"
         private const val PREF_MIGRATED_BASE_URL = "manual_base_url_migrated_v1"
         private const val LEGACY_BASE_URL_PREF_PREFIX = "overrideBaseUrl_v"
+        private const val PREF_DEFAULT_BASE_URL = "automatic_base_url_default"
+        private const val PREF_LATEST_BASE_URL = "latest_base_url"
+        private const val PREF_LATEST_BASE_URL_FETCHED_AT = "latest_base_url_fetched_at"
+        private const val PREF_LATEST_BASE_URL_ATTEMPTED_AT = "latest_base_url_attempted_at"
+        private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
     }
 }
