@@ -1,58 +1,8 @@
 ext {
     extName = 'Wolf.com'
     extClass = '.WolfFactory'
-    extVersionCode = 9
+    extVersionCode = 10
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
-
-androidComponents {
-    onVariants(selector().all(), { variant ->
-        def kotlin = variant.sources.kotlin
-        if (kotlin != null) {
-            def variantName = variant.name.capitalize()
-
-            def task = tasks.register("update${variantName}DomainNumber", UpdateDomainNumberTask) {
-                defaultDomainNumber.set(425)
-
-                outputs.upToDateWhen { false }
-            }
-
-            kotlin.addGeneratedSourceDirectory(task) { it.outputDir }
-        }
-    })
-}
-
-abstract class UpdateDomainNumberTask extends DefaultTask {
-
-    @Input
-    abstract Property<Integer> getDefaultDomainNumber()
-
-    @OutputDirectory
-    abstract DirectoryProperty getOutputDir()
-
-    @TaskAction
-    void action() {
-        def domainNumber = defaultDomainNumber.get()
-        try {
-            def response = new URL("https://a14c.com/").text
-            def matcher = response =~ ~/https?:\/\/wfwf(\d+)\.com/
-            if (matcher) {
-                domainNumber = matcher[0][1]
-                println("[Wolf.com] new domain number: $domainNumber")
-            } else {
-                println("[Wolf.com] domain number not found using default: $domainNumber")
-            }
-        } catch (Exception e) {
-            println("[Wolf.com] domain lookup failed using default: $domainNumber (${e.class.simpleName})")
-        }
-
-        def domainNumberFile = outputDir.get().file("DomainNumber.kt").asFile
-        domainNumberFile.parentFile.mkdirs()
-        domainNumberFile.withPrintWriter {
-            it.println("package eu.kanade.tachiyomi.extension.ko.wolfdotcom\n")
-            it.println("const val DEFAULT_DOMAIN_NUMBER = \"$domainNumber\"")
-        }
-    }
-}

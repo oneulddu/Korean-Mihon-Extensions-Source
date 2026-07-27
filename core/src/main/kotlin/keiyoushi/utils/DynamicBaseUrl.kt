@@ -132,6 +132,21 @@ fun normalizeBaseUrl(
     return url.newBuilder().encodedPath("/").build().toString().trimEnd('/')
 }
 
+fun shouldInvalidateNumberedDomainCache(
+    cachedBaseUrl: String?,
+    legacyDomainNumber: String?,
+    minimumDomainNumber: Int,
+    hostNumberRegex: Regex,
+): Boolean {
+    val cachedDomainNumber = cachedBaseUrl
+        ?.toHttpUrlOrNull()
+        ?.host
+        ?.let { hostNumberRegex.matchEntire(it)?.groupValues?.getOrNull(1)?.toIntOrNull() }
+        ?: legacyDomainNumber?.toIntOrNull()
+
+    return cachedDomainNumber == null || cachedDomainNumber < minimumDomainNumber
+}
+
 fun Request.rewriteBaseUrl(
     targetBaseUrl: String,
     shouldRewriteHost: (String) -> Boolean,
