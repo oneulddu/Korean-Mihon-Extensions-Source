@@ -494,12 +494,15 @@ class Jjaptoon :
                 .build(),
         ),
     ).execute().use { response ->
-        automaticRedirectLocation(response)?.let { return@use it }
+        automaticRedirectLocation(response)
+            ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_JSON_REDIRECT) }
+            ?.let { return@use it }
         if (!response.isSuccessful) return@use null
         val body = response.body.string()
         runCatching { json.decodeFromString<LatestDomainResponse>(body).domain }
             .getOrNull()
             ?.let { normalizeBaseUrl(it, ::isAllowedAutomaticUrl) }
+            ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_JSON) }
     }
 
     private fun fetchLatestBaseUrlFromPortal(): String? = noRedirectClient.newCall(
@@ -511,7 +514,9 @@ class Jjaptoon :
                 .build(),
         ),
     ).execute().use { response ->
-        automaticRedirectLocation(response)?.let { return@use it }
+        automaticRedirectLocation(response)
+            ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_PORTAL_REDIRECT) }
+            ?.let { return@use it }
         if (!response.isSuccessful) return@use null
 
         response.asJsoup()
@@ -520,6 +525,7 @@ class Jjaptoon :
             .mapNotNull { it.absUrl("href").toHttpUrlOrNull() }
             .mapNotNull { normalizeBaseUrl(it.toString(), ::isAllowedAutomaticUrl) }
             .firstOrNull()
+            ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_PORTAL) }
     }
 
     private fun automaticRedirectLocation(response: Response): String? {
@@ -556,7 +562,7 @@ class Jjaptoon :
                 .takeIf { response.isSuccessful }
                 ?.toString()
                 ?.trimEnd('/')
-        }
+        }?.also { saveAutomaticBaseUrlSource(SOURCE_NUMBERED_PROBE) }
     }.getOrNull()
 
     private fun migrateAutomaticBaseUrlCache() {
@@ -574,6 +580,7 @@ class Jjaptoon :
                 remove(LATEST_DOMAIN_URL_PREF)
                 remove(LATEST_DOMAIN_FETCHED_AT_PREF)
                 remove(LATEST_DOMAIN_ATTEMPTED_AT_PREF)
+                remove(PREF_LATEST_DOMAIN_SOURCE)
             }
         }.apply()
     }
@@ -597,9 +604,25 @@ class Jjaptoon :
 
     private fun normalizeManualBaseUrl(value: String): String? = normalizeBaseUrl(value)
 
-    private fun baseUrlPreferenceSummary(): String = getManualBaseUrl()
-        ?.let { "현재 수동 주소: $it" }
-        ?: "현재 자동 주소: ${getCachedLatestBaseUrl() ?: fallbackBaseUrl}\n$BASE_URL_PREF_SUMMARY"
+    private fun saveAutomaticBaseUrlSource(source: String) {
+        preferences.edit().putString(PREF_LATEST_DOMAIN_SOURCE, source).apply()
+    }
+
+    private fun baseUrlPreferenceSummary(): String {
+        getManualBaseUrl()?.let { return "현재 수동 주소: $it" }
+
+        val cachedBaseUrl = getCachedLatestBaseUrl()
+        val source = preferences.getString(PREF_LATEST_DOMAIN_SOURCE, null)
+        val fetchedAt = preferences.getLong(LATEST_DOMAIN_FETCHED_AT_PREF, 0L)
+        val sourceSummary = when {
+            cachedBaseUrl == null -> SOURCE_BUILD_DEFAULT
+            System.currentTimeMillis() - fetchedAt < DynamicBaseUrlResolver.DEFAULT_CACHE_DURATION_MS ->
+                "유효 자동 캐시 (${source ?: SOURCE_LEGACY_CACHE})"
+            else -> "마지막 정상 캐시 (${source ?: SOURCE_LEGACY_CACHE})"
+        }
+
+        return "현재 자동 주소: ${cachedBaseUrl ?: fallbackBaseUrl}\n탐색 출처: $sourceSummary\n$BASE_URL_PREF_SUMMARY"
+    }
 
     private fun parseStatus(text: String): Int = when {
         "완결" in text -> SManga.COMPLETED
@@ -626,11 +649,19 @@ class Jjaptoon :
         private const val LATEST_DOMAIN_URL_PREF = "latest_domain_url"
         private const val LATEST_DOMAIN_FETCHED_AT_PREF = "latest_domain_fetched_at"
         private const val LATEST_DOMAIN_ATTEMPTED_AT_PREF = "latest_domain_attempted_at"
+        private const val PREF_LATEST_DOMAIN_SOURCE = "latest_domain_source"
         private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
         private const val FILTER_ALL = "all"
         private const val SORT_LATEST = "latest"
         private const val SORT_POPULAR = "popular"
         private const val HOME_PAGINATOR = "comicsPage"
+        private const val SOURCE_OFFICIAL_JSON = "공식 JSON"
+        private const val SOURCE_OFFICIAL_JSON_REDIRECT = "공식 JSON 리다이렉트"
+        private const val SOURCE_OFFICIAL_PORTAL = "공식 포털"
+        private const val SOURCE_OFFICIAL_PORTAL_REDIRECT = "공식 포털 리다이렉트"
+        private const val SOURCE_NUMBERED_PROBE = "번호형 주소 확인"
+        private const val SOURCE_LEGACY_CACHE = "기존 자동 캐시"
+        private const val SOURCE_BUILD_DEFAULT = "빌드 기본 주소"
 
         private const val DEFAULT_DOMAIN_NUMBER = 4
         private val LEGACY_DEFAULT_BASE_URLS = setOf(
