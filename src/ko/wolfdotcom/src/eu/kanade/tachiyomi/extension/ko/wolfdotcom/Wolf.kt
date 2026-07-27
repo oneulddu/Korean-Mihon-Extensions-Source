@@ -20,6 +20,7 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.normalizeBaseUrl
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.rewriteBaseUrl
+import keiyoushi.utils.shouldInvalidateNumberedDomainCache
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.Serializable
@@ -331,10 +332,22 @@ open class Wolf(
             val prefDefaultValue = preference.getString(PREF_DOMAIN_NUM_DEFAULT, "")!!
 
             if (prefDefaultValue != DEFAULT_DOMAIN_NUMBER) {
-                preference.edit()
-                    .putString(PREF_DOMAIN_NUM_DEFAULT, DEFAULT_DOMAIN_NUMBER)
-                    .putString(PREF_DOMAIN_NUM, DEFAULT_DOMAIN_NUMBER)
-                    .apply()
+                val shouldInvalidateCache = shouldInvalidateNumberedDomainCache(
+                    cachedBaseUrl = preference.getString(PREF_LATEST_DOMAIN_URL, null),
+                    legacyDomainNumber = preference.getString(PREF_LATEST_DOMAIN_NUM, null),
+                    minimumDomainNumber = DEFAULT_DOMAIN_NUMBER.toInt(),
+                    hostNumberRegex = domainNumberRegex,
+                )
+                preference.edit().apply {
+                    putString(PREF_DOMAIN_NUM_DEFAULT, DEFAULT_DOMAIN_NUMBER)
+                    putString(PREF_DOMAIN_NUM, DEFAULT_DOMAIN_NUMBER)
+                    if (shouldInvalidateCache) {
+                        remove(PREF_LATEST_DOMAIN_NUM)
+                        remove(PREF_LATEST_DOMAIN_URL)
+                        remove(PREF_LATEST_DOMAIN_FETCHED_AT)
+                        remove(PREF_LATEST_DOMAIN_ATTEMPTED_AT)
+                    }
+                }.apply()
 
                 field = DEFAULT_DOMAIN_NUMBER
                 return DEFAULT_DOMAIN_NUMBER
@@ -438,6 +451,7 @@ open class Wolf(
 
 private const val PREF_DOMAIN_NUM = "domain_number"
 private const val PREF_DOMAIN_NUM_DEFAULT = "domain_number_default"
+private const val DEFAULT_DOMAIN_NUMBER = "426"
 private const val PREF_MANUAL_BASE_URL = "manual_base_url"
 private const val PREF_LATEST_DOMAIN_NUM = "latest_domain_number"
 private const val PREF_LATEST_DOMAIN_URL = "latest_domain_url"

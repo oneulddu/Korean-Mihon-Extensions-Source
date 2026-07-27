@@ -97,6 +97,17 @@ class DynamicBaseUrlTest {
         assertTrue(cdnRequest === cdnRequest.rewriteBaseUrl("https://site9.com") { it.matches(Regex("site\\d+\\.com")) })
     }
 
+    @Test
+    fun numberedDomainCacheIsInvalidatedOnlyWhenOlderThanNewDefault() {
+        val hostRegex = Regex("site(\\d+)\\.com")
+
+        assertTrue(shouldInvalidateNumberedDomainCache("https://site425.com", "425", 426, hostRegex))
+        assertEquals(false, shouldInvalidateNumberedDomainCache("https://site426.com", "425", 426, hostRegex))
+        assertEquals(false, shouldInvalidateNumberedDomainCache("https://site427.com", "425", 426, hostRegex))
+        assertEquals(false, shouldInvalidateNumberedDomainCache(null, "427", 426, hostRegex))
+        assertTrue(shouldInvalidateNumberedDomainCache(null, null, 426, hostRegex))
+    }
+
     private fun resolver(
         store: FakeStorage,
         now: () -> Long,
