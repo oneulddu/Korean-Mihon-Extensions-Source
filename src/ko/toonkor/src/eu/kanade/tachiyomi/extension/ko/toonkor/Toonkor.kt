@@ -272,19 +272,38 @@ class Toonkor :
             ?: defaultBaseUrl
 
         noRedirectClient.newCall(GET(probeBaseUrl, headers)).execute().use { response ->
-            response.header("Location")
-                ?.let { response.request.url.resolve(it) }
-                ?.takeIf(::isValidAutomaticBaseUrl)
-                ?.toString()
-                ?.trimEnd('/')
-                ?: response.request.url
-                    .takeIf(::isValidAutomaticBaseUrl)
+            val requestBaseUrl = response.request.url.takeIf(::isValidAutomaticBaseUrl)
+                ?: return@use null
+
+            if (response.code in 300..399) {
+                val redirectUrl = response.header("Location")
+                    ?.let(response.request.url::resolve)
+                    ?: return@use null
+                val redirectedBaseUrl = normalizeBaseUrl(redirectUrl.toString(), ::isAllowedAutomaticUrl)
+                if (redirectedBaseUrl != null) return@use redirectedBaseUrl
+
+                return@use requestBaseUrl
+                    .takeIf { redirectUrl.host == it.host && isAllowedAutomaticRedirect(redirectUrl) }
                     ?.toString()
                     ?.trimEnd('/')
+            }
+
+            requestBaseUrl
+                .takeIf { response.isSuccessful }
+                ?.toString()
+                ?.trimEnd('/')
         }
     }.getOrNull()
 
     private fun isAllowedAutomaticUrl(url: HttpUrl): Boolean = url.host.matches(AUTOMATIC_HOST_REGEX)
+
+    private fun isAllowedAutomaticRedirect(url: HttpUrl): Boolean = isAllowedAutomaticUrl(url) &&
+        url.scheme == "https" &&
+        url.port == 443 &&
+        url.username.isEmpty() &&
+        url.password.isEmpty() &&
+        url.query == null &&
+        url.fragment == null
 
     private fun isValidAutomaticBaseUrl(url: HttpUrl): Boolean = normalizeBaseUrl(
         url.toString(),
