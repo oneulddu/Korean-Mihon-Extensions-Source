@@ -371,12 +371,7 @@ class Jjaptoon :
                 SChapter.create().apply {
                     setUrlWithoutDomain(element.absUrl("href"))
                     name = element.selectFirst("p")?.text()?.trim().orEmpty()
-                    date_upload = element.select("p")
-                        .asSequence()
-                        .map { it.text().trim() }
-                        .firstOrNull(chapterDateRegex::matches)
-                        ?.let(dateFormat::tryParse)
-                        ?: 0L
+                    date_upload = parseJjaptoonChapterDate(element.select("p").eachText())
                 }
             }
     }
@@ -682,14 +677,32 @@ class Jjaptoon :
             val domain: String,
         )
 
-        private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).apply {
-            timeZone = TimeZone.getTimeZone("Asia/Seoul")
-            isLenient = false
-        }
-        private val chapterDateRegex = Regex("""\d{4}-\d{2}-\d{2}""")
-
         private val imageSrcRegex = """loaded\s*\?\s*'([^']+)'""".toRegex()
 
         private val ignoredBadges = setOf("완결", "연재", "월", "화", "수", "목", "금", "토", "일")
     }
+}
+
+private const val CHAPTER_DATE_LENGTH = 10
+private val chapterDateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).apply {
+    timeZone = TimeZone.getTimeZone("Asia/Seoul")
+    isLenient = false
+}
+private val chapterDateTimeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT).apply {
+    timeZone = TimeZone.getTimeZone("Asia/Seoul")
+    isLenient = false
+}
+private val chapterDateRegex = Regex("""\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?""")
+
+internal fun parseJjaptoonChapterDate(paragraphTexts: List<String>): Long = paragraphTexts
+    .asSequence()
+    .drop(1)
+    .map(::parseJjaptoonChapterDateText)
+    .firstOrNull { it > 0L }
+    ?: 0L
+
+private fun parseJjaptoonChapterDateText(text: String): Long {
+    val date = chapterDateRegex.find(text)?.value ?: return 0L
+    val format = if (date.length > CHAPTER_DATE_LENGTH) chapterDateTimeFormat else chapterDateFormat
+    return synchronized(format) { format.tryParse(date) }
 }
