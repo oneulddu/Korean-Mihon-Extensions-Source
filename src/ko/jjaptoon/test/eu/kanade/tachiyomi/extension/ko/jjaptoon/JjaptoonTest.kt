@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.ko.jjaptoon
 
+import org.jsoup.Jsoup
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import java.time.LocalDateTime
@@ -58,6 +59,44 @@ class JjaptoonTest {
                 """<a href="https://www.jjaptoon005.com.evil.example">가짜 주소</a>""",
                 "https://짭툰.net/",
             ),
+        )
+    }
+
+    @Test
+    fun pageImagesExcludeAdvertisementInquiries() {
+        val document = Jsoup.parse(
+            """
+            <main>
+                <section data-testid="advertisement-grid">
+                    <img src="https://cdn.example/ads/contact-1.png" alt="광고문의">
+                    <img src="https://cdn.example/ads/contact-2.png" alt="광고문의">
+                </section>
+                <main>
+                    <div data-reading-image-index="0">
+                        <img src="https://cdn.example/pages/1.jpg" alt="작품 1화 1">
+                    </div>
+                    <div data-reading-image-index="1">
+                        <img data-src="/pages/2.jpg" alt="작품 1화 2">
+                    </div>
+                    <div data-reading-image-index="2">
+                        <img :src="loaded ? 'https://cdn.example/pages/3.jpg' : ''" alt="작품 1화 3">
+                    </div>
+                    <div data-reading-image-index="3">
+                        <img src="https://cdn.example/ads/contact-3.png" alt="광고문의">
+                    </div>
+                </main>
+            </main>
+            """.trimIndent(),
+            "https://www.jjaptoon005.com/chapters/1",
+        )
+
+        assertEquals(
+            listOf(
+                "https://cdn.example/pages/1.jpg",
+                "https://www.jjaptoon005.com/pages/2.jpg",
+                "https://cdn.example/pages/3.jpg",
+            ),
+            parseJjaptoonPageImageUrls(document),
         )
     }
 

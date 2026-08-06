@@ -377,16 +377,10 @@ class Jjaptoon :
         headersBuilder().set("Referer", baseUrl + chapter.url).build(),
     )
 
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-
-        return document.select("main img")
-            .mapNotNull { it.imageUrl() ?: imageSrcRegex.find(it.attr(":src"))?.groupValues?.get(1) }
-            .distinct()
-            .mapIndexed { index, imageUrl ->
-                Page(index, response.request.url.toString(), imageUrl.replace(" ", "%20"))
-            }
-    }
+    override fun pageListParse(response: Response): List<Page> = parseJjaptoonPageImageUrls(response.asJsoup())
+        .mapIndexed { index, imageUrl ->
+            Page(index, response.request.url.toString(), imageUrl.replace(" ", "%20"))
+        }
 
     override fun imageRequest(page: Page): Request = GET(
         page.imageUrl!!,
@@ -595,12 +589,6 @@ class Jjaptoon :
         else -> SManga.UNKNOWN
     }
 
-    private fun Element.imageUrl(): String? = when {
-        hasAttr("data-original") -> absUrl("data-original")
-        hasAttr("data-src") -> absUrl("data-src")
-        else -> absUrl("src")
-    }.takeIf { it.isNotBlank() }
-
     companion object {
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
         private const val BASE_URL_PREF_SUMMARY = "비워두면 공식 포털에서 최신 주소를 자동 확인합니다."
@@ -639,8 +627,6 @@ class Jjaptoon :
 
         private val JJAPTOON_HOST_REGEX = Regex("^(?:www\\.)?jjaptoon\\d{3}\\.com$")
         private val JJAPTOON_HOST_NUMBER_REGEX = Regex("^(?:www\\.)?jjaptoon(\\d{3})\\.com$")
-        private val imageSrcRegex = """loaded\s*\?\s*'([^']+)'""".toRegex()
-
         private val ignoredBadges = setOf("완결", "연재", "월", "화", "수", "목", "금", "토", "일")
     }
 }
@@ -655,9 +641,16 @@ private val chapterDateTimeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.
     isLenient = false
 }
 private val chapterDateRegex = Regex("""\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?""")
+private val imageSrcRegex = """loaded\s*\?\s*'([^']+)'""".toRegex()
 private val jjaptoonDomainHostRegex = Regex("""^(?:www\.)?jjaptoon\d{3}\.com$""")
 private val latestJjaptoonDomainRegex =
     Regex("""(?i)(?<![a-z0-9.-])(?:https?://)?(?:www\.)?jjaptoon\d{3}\.com(?![a-z0-9.-])""")
+
+private fun Element.imageUrl(): String? = when {
+    hasAttr("data-original") -> absUrl("data-original")
+    hasAttr("data-src") -> absUrl("data-src")
+    else -> absUrl("src")
+}.takeIf { it.isNotBlank() }
 
 internal fun parseJjaptoonLatestBaseUrl(html: String, portalUrl: String): String? {
     val document = org.jsoup.Jsoup.parse(html, portalUrl)
@@ -676,6 +669,12 @@ internal fun parseJjaptoonLatestBaseUrl(html: String, portalUrl: String): String
         .mapNotNull { normalizeBaseUrl(it) { url -> url.host.matches(jjaptoonDomainHostRegex) } }
         .firstOrNull()
 }
+
+internal fun parseJjaptoonPageImageUrls(document: Document): List<String> = document
+    .select("[data-reading-image-index] > img")
+    .filterNot { it.attr("alt").contains("광고문의") }
+    .mapNotNull { it.imageUrl() ?: imageSrcRegex.find(it.attr(":src"))?.groupValues?.get(1) }
+    .distinct()
 
 internal fun parseJjaptoonChapterDate(paragraphTexts: List<String>): Long = paragraphTexts
     .asSequence()
