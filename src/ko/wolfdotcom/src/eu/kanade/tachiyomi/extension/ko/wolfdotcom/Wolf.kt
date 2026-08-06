@@ -25,7 +25,6 @@ import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
@@ -320,8 +319,21 @@ open class Wolf(
 
     private fun baseUrlPreferenceSummary(): String = getManualBaseUrl()
         ?.let { "현재 수동 주소: $it" }
-        ?: "현재 자동 주소: ${latestBaseUrlResolver.cachedBaseUrl() ?: "https://${domainHost(domainNumber)}"}\n" +
-        "비워두면 공식 안내 사이트에서 최신 주소를 자동 확인합니다."
+        ?: run {
+            val cachedBaseUrl = latestBaseUrlResolver.cachedBaseUrl()
+            val source = preference.getString(PREF_LATEST_DOMAIN_SOURCE, null)
+            val fetchedAt = preference.getLong(PREF_LATEST_DOMAIN_FETCHED_AT, 0L)
+            val sourceSummary = when {
+                cachedBaseUrl == null -> SOURCE_BUILD_DEFAULT
+                System.currentTimeMillis() - fetchedAt < DynamicBaseUrlResolver.DEFAULT_CACHE_DURATION_MS ->
+                    "유효 자동 캐시 (${source ?: SOURCE_LEGACY_CACHE})"
+                else -> "마지막 정상 캐시 (${source ?: SOURCE_LEGACY_CACHE})"
+            }
+
+            "현재 자동 주소: ${cachedBaseUrl ?: "https://${domainHost(domainNumber)}"}\n" +
+                "탐색 출처: $sourceSummary\n" +
+                "비워두면 공식 안내 사이트에서 최신 주소를 자동 확인합니다."
+        }
 
     private var domainNumber = ""
         get() {
@@ -346,6 +358,7 @@ open class Wolf(
                         remove(PREF_LATEST_DOMAIN_URL)
                         remove(PREF_LATEST_DOMAIN_FETCHED_AT)
                         remove(PREF_LATEST_DOMAIN_ATTEMPTED_AT)
+                        remove(PREF_LATEST_DOMAIN_SOURCE)
                     }
                 }.apply()
 
@@ -393,27 +406,24 @@ open class Wolf(
         ).execute().use { response ->
             if (!response.isSuccessful) return@use null
 
-            response.asJsoup()
-                .select("a[href]")
-                .asSequence()
-                .mapNotNull { it.attr("href").toHttpUrlOrNull() }
-                .firstOrNull(::isValidDiscoveredDomain)
-                ?.toString()
-                ?.trimEnd('/')
+            parseWolfLatestBaseUrl(response.body.string(), response.request.url.toString())
+                ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_PORTAL) }
         }
     }.getOrNull()
 
     private fun resolveRedirectBaseUrl(): String? = runCatching {
         noRedirectClient.newCall(GET("https://${domainHost(domainNumber)}", headers)).execute().use { response ->
-            response.header("Location")
-                ?.toHttpUrlOrNull()
+            val resolvedBaseUrl = response.header("Location")
+                ?.let(response.request.url::resolve)
                 ?.takeIf(::isValidDiscoveredDomain)
                 ?.toString()
                 ?.trimEnd('/')
                 ?: response.request.url
-                    .takeIf(::isValidDiscoveredDomain)
+                    .takeIf { response.isSuccessful && isValidDiscoveredDomain(it) }
                     ?.toString()
                     ?.trimEnd('/')
+
+            resolvedBaseUrl?.also { saveAutomaticBaseUrlSource(SOURCE_NUMBERED_PROBE) }
         }
     }.getOrNull()
 
@@ -424,6 +434,10 @@ open class Wolf(
         url.query == null &&
         url.username.isEmpty() &&
         url.password.isEmpty()
+
+    private fun saveAutomaticBaseUrlSource(source: String) {
+        preference.edit().putString(PREF_LATEST_DOMAIN_SOURCE, source).apply()
+    }
 
     private fun domainHost(number: String) = "wfwf$number.com"
 
@@ -444,18 +458,42 @@ open class Wolf(
 
     companion object {
         private const val MAX_SYNTHETIC_CHAPTERS = 5_000
-        private val domainHostRegex = Regex("""^wfwf\d+\.com$""")
-        private val domainNumberRegex = Regex("""^wfwf(\d+)\.com$""")
+        private val domainHostRegex = wolfDomainHostRegex
+        private val domainNumberRegex = wolfDomainNumberRegex
     }
 }
 
 private const val PREF_DOMAIN_NUM = "domain_number"
 private const val PREF_DOMAIN_NUM_DEFAULT = "domain_number_default"
-private const val DEFAULT_DOMAIN_NUMBER = "426"
+private const val DEFAULT_DOMAIN_NUMBER = "435"
 private const val PREF_MANUAL_BASE_URL = "manual_base_url"
 private const val PREF_LATEST_DOMAIN_NUM = "latest_domain_number"
 private const val PREF_LATEST_DOMAIN_URL = "latest_domain_url"
 private const val PREF_LATEST_DOMAIN_FETCHED_AT = "latest_domain_fetched_at"
 private const val PREF_LATEST_DOMAIN_ATTEMPTED_AT = "latest_domain_attempted_at"
+private const val PREF_LATEST_DOMAIN_SOURCE = "latest_domain_source"
 private const val LATEST_DOMAIN_ENDPOINT = "https://a14c.com/"
 private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
+private const val SOURCE_OFFICIAL_PORTAL = "공식 안내 사이트"
+private const val SOURCE_NUMBERED_PROBE = "번호형 주소 확인"
+private const val SOURCE_LEGACY_CACHE = "기존 자동 캐시"
+private const val SOURCE_BUILD_DEFAULT = "빌드 기본 주소"
+
+private val wolfDomainHostRegex = Regex("""^wfwf\d+\.com$""")
+private val wolfDomainNumberRegex = Regex("""^wfwf(\d+)\.com$""")
+private val latestWolfDomainRegex =
+    Regex("""(?i)(?<![a-z0-9.-])(?:https?://)?wfwf\d+\.com(?![a-z0-9.-])""")
+
+internal fun parseWolfLatestBaseUrl(html: String, portalUrl: String): String? {
+    val document = Jsoup.parse(html, portalUrl)
+    val candidates = sequence {
+        yieldAll(document.select("a[href]").asSequence().map { it.absUrl("href") })
+        yield(document.outerHtml())
+    }
+
+    return candidates
+        .flatMap { latestWolfDomainRegex.findAll(it).map(MatchResult::value) }
+        .map { if (it.startsWith("http", ignoreCase = true)) it else "https://$it" }
+        .mapNotNull { normalizeBaseUrl(it) { url -> url.host.matches(wolfDomainHostRegex) } }
+        .firstOrNull()
+}

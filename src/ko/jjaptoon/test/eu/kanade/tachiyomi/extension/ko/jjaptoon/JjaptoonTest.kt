@@ -25,6 +25,42 @@ class JjaptoonTest {
         assertEquals(0L, parseJjaptoonChapterDate(listOf("날짜 없음")))
     }
 
+    @Test
+    fun latestDomainParsesOfficialPortalMarkup() {
+        assertEquals(
+            "https://www.jjaptoon005.com",
+            parseJjaptoonLatestBaseUrl(
+                """<div id="latestDomain">www.jjaptoon005.com</div>""",
+                "https://짭툰.net/",
+            ),
+        )
+        assertEquals(
+            "https://jjaptoon006.com",
+            parseJjaptoonLatestBaseUrl(
+                """<script>window.domain = {"domain":"https://jjaptoon006.com"}</script>""",
+                "https://짭툰.net/",
+            ),
+        )
+    }
+
+    @Test
+    fun latestDomainRejectsUnrelatedHosts() {
+        assertEquals(
+            null,
+            parseJjaptoonLatestBaseUrl(
+                """<a href="https://example.com">이동</a>""",
+                "https://짭툰.net/",
+            ),
+        )
+        assertEquals(
+            null,
+            parseJjaptoonLatestBaseUrl(
+                """<a href="https://www.jjaptoon005.com.evil.example">가짜 주소</a>""",
+                "https://짭툰.net/",
+            ),
+        )
+    }
+
     private fun epochMillis(year: Int, month: Int, day: Int, hour: Int, minute: Int): Long = LocalDateTime
         .of(year, month, day, hour, minute)
         .atZone(ZoneId.of("Asia/Seoul"))

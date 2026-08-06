@@ -22,13 +22,9 @@ import keiyoushi.utils.normalizeBaseUrl
 import keiyoushi.utils.rewriteBaseUrl
 import keiyoushi.utils.shouldInvalidateNumberedDomainCache
 import keiyoushi.utils.tryParse
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
@@ -46,7 +42,7 @@ class Jjaptoon :
 
     override val name = "짭툰"
 
-    private val fallbackBaseUrl = "https://www.jjaptoon004.com"
+    private val fallbackBaseUrl = "https://www.jjaptoon005.com"
 
     override val baseUrl: String
         get() = getActiveBaseUrl()
@@ -477,28 +473,7 @@ class Jjaptoon :
         return request.rewriteBaseUrl(latestBaseUrlResolver.resolve()) { it.matches(JJAPTOON_HOST_REGEX) }
     }
 
-    private fun fetchLatestBaseUrl(): String? = runCatching(::fetchLatestBaseUrlFromJson).getOrNull()
-        ?: runCatching(::fetchLatestBaseUrlFromPortal).getOrNull()
-
-    private fun fetchLatestBaseUrlFromJson(): String? = noRedirectClient.newCall(
-        GET(
-            LATEST_DOMAIN_JSON_ENDPOINT,
-            Headers.Builder()
-                .set("Accept", "application/json")
-                .set("Cache-Control", "no-cache")
-                .build(),
-        ),
-    ).execute().use { response ->
-        automaticRedirectLocation(response)
-            ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_JSON_REDIRECT) }
-            ?.let { return@use it }
-        if (!response.isSuccessful) return@use null
-        val body = response.body.string()
-        runCatching { json.decodeFromString<LatestDomainResponse>(body).domain }
-            .getOrNull()
-            ?.let { normalizeBaseUrl(it, ::isAllowedAutomaticUrl) }
-            ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_JSON) }
-    }
+    private fun fetchLatestBaseUrl(): String? = runCatching(::fetchLatestBaseUrlFromPortal).getOrNull()
 
     private fun fetchLatestBaseUrlFromPortal(): String? = noRedirectClient.newCall(
         GET(
@@ -514,12 +489,7 @@ class Jjaptoon :
             ?.let { return@use it }
         if (!response.isSuccessful) return@use null
 
-        response.asJsoup()
-            .select("a[href]")
-            .asSequence()
-            .mapNotNull { it.absUrl("href").toHttpUrlOrNull() }
-            .mapNotNull { normalizeBaseUrl(it.toString(), ::isAllowedAutomaticUrl) }
-            .firstOrNull()
+        parseJjaptoonLatestBaseUrl(response.body.string(), response.request.url.toString())
             ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_PORTAL) }
     }
 
@@ -634,8 +604,7 @@ class Jjaptoon :
     companion object {
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
         private const val BASE_URL_PREF_SUMMARY = "비워두면 공식 포털에서 최신 주소를 자동 확인합니다."
-        private const val LATEST_DOMAIN_PORTAL = "https://www.jjaptoon.com/"
-        private const val LATEST_DOMAIN_JSON_ENDPOINT = "${LATEST_DOMAIN_PORTAL}data/domain.json"
+        private const val LATEST_DOMAIN_PORTAL = "https://짭툰.net/"
         private const val PREF_MANUAL_BASE_URL = "manual_base_url"
         private const val PREF_MANUAL_BASE_URL_MIGRATED = "manual_base_url_migrated_v2"
         private const val LEGACY_BASE_URL_PREF_PREFIX = "overrideBaseUrl_v"
@@ -650,15 +619,13 @@ class Jjaptoon :
         private const val SORT_LATEST = "latest"
         private const val SORT_POPULAR = "popular"
         private const val HOME_PAGINATOR = "comicsPage"
-        private const val SOURCE_OFFICIAL_JSON = "공식 JSON"
-        private const val SOURCE_OFFICIAL_JSON_REDIRECT = "공식 JSON 리다이렉트"
         private const val SOURCE_OFFICIAL_PORTAL = "공식 포털"
         private const val SOURCE_OFFICIAL_PORTAL_REDIRECT = "공식 포털 리다이렉트"
         private const val SOURCE_NUMBERED_PROBE = "번호형 주소 확인"
         private const val SOURCE_LEGACY_CACHE = "기존 자동 캐시"
         private const val SOURCE_BUILD_DEFAULT = "빌드 기본 주소"
 
-        private const val DEFAULT_DOMAIN_NUMBER = 4
+        private const val DEFAULT_DOMAIN_NUMBER = 5
         private val LEGACY_DEFAULT_BASE_URLS = setOf(
             "https://www.jjaptoon003.com",
             "https://jjaptoon003.com",
@@ -666,17 +633,12 @@ class Jjaptoon :
             "https://www.jjabtoon003.com",
             "https://www.jjaptoon004.com",
             "https://jjaptoon004.com",
+            "https://www.jjaptoon005.com",
+            "https://jjaptoon005.com",
         )
 
         private val JJAPTOON_HOST_REGEX = Regex("^(?:www\\.)?jjaptoon\\d{3}\\.com$")
         private val JJAPTOON_HOST_NUMBER_REGEX = Regex("^(?:www\\.)?jjaptoon(\\d{3})\\.com$")
-        private val json = Json { ignoreUnknownKeys = true }
-
-        @Serializable
-        private data class LatestDomainResponse(
-            val domain: String,
-        )
-
         private val imageSrcRegex = """loaded\s*\?\s*'([^']+)'""".toRegex()
 
         private val ignoredBadges = setOf("완결", "연재", "월", "화", "수", "목", "금", "토", "일")
@@ -693,6 +655,27 @@ private val chapterDateTimeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.
     isLenient = false
 }
 private val chapterDateRegex = Regex("""\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?""")
+private val jjaptoonDomainHostRegex = Regex("""^(?:www\.)?jjaptoon\d{3}\.com$""")
+private val latestJjaptoonDomainRegex =
+    Regex("""(?i)(?<![a-z0-9.-])(?:https?://)?(?:www\.)?jjaptoon\d{3}\.com(?![a-z0-9.-])""")
+
+internal fun parseJjaptoonLatestBaseUrl(html: String, portalUrl: String): String? {
+    val document = org.jsoup.Jsoup.parse(html, portalUrl)
+    val candidates = sequence {
+        yieldAll(
+            document.select("#latestDomain, #address, [data-domain]").asSequence()
+                .flatMap { sequenceOf(it.text(), it.attr("data-domain")) },
+        )
+        yieldAll(document.select("a[href]").asSequence().map { it.absUrl("href") })
+        yield(document.outerHtml())
+    }
+
+    return candidates
+        .flatMap { latestJjaptoonDomainRegex.findAll(it).map(MatchResult::value) }
+        .map { if (it.startsWith("http", ignoreCase = true)) it else "https://$it" }
+        .mapNotNull { normalizeBaseUrl(it) { url -> url.host.matches(jjaptoonDomainHostRegex) } }
+        .firstOrNull()
+}
 
 internal fun parseJjaptoonChapterDate(paragraphTexts: List<String>): Long = paragraphTexts
     .asSequence()
