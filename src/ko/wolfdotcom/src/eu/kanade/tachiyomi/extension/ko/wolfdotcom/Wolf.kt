@@ -60,19 +60,23 @@ open class Wolf(
 
     private val preference: SharedPreferences by getPreferencesLazy()
 
-    private val domainLookupClient = network.client.newBuilder()
-        .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .build()
-
     private val noRedirectClient = network.client.newBuilder()
         .followRedirects(false)
+        .followSslRedirects(false)
+        .callTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
 
     private val latestBaseUrlResolver by lazy {
         migrateLegacyDomainCache()
+        if (!preference.getBoolean("official_guide_discovery_v1", false)) {
+            preference.edit()
+                .remove(PREF_LATEST_DOMAIN_FETCHED_AT)
+                .remove(PREF_LATEST_DOMAIN_ATTEMPTED_AT)
+                .putBoolean("official_guide_discovery_v1", true)
+                .apply()
+        }
         DynamicBaseUrlResolver(
             storage = SharedPreferencesBaseUrlStorage(preference),
             keys = BaseUrlCacheKeys(
@@ -291,7 +295,7 @@ open class Wolf(
             title = "Override BaseUrl"
             summary = baseUrlPreferenceSummary()
             setDefaultValue("")
-            dialogMessage = "비워두면 $LATEST_DOMAIN_ENDPOINT 에서 최신 주소를 자동 확인합니다."
+            dialogMessage = "비워두면 공식 안내 사이트와 공식 텔레그램 채널에서 최신 주소를 자동 확인합니다."
             setOnPreferenceChangeListener { preference, newValue ->
                 val value = (newValue as? String).orEmpty().trim()
                 if (value.isEmpty()) {
@@ -394,22 +398,12 @@ open class Wolf(
         return chain.proceed(rewrittenRequest)
     }
 
-    private fun fetchLatestBaseUrl(): String? = runCatching {
-        domainLookupClient.newCall(
-            GET(
-                LATEST_DOMAIN_ENDPOINT,
-                headersBuilder()
-                    .set("Accept", "text/html,application/xhtml+xml")
-                    .set("Cache-Control", "no-cache")
-                    .build(),
-            ),
-        ).execute().use { response ->
-            if (!response.isSuccessful) return@use null
+    private val domainDiscovery by lazy { WolfDomainDiscovery(noRedirectClient) }
 
-            parseWolfLatestBaseUrl(response.body.string(), response.request.url.toString())
-                ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_PORTAL) }
-        }
-    }.getOrNull()
+    private fun fetchLatestBaseUrl(): String? = domainDiscovery.discover()?.let {
+        saveAutomaticBaseUrlSource(it.source)
+        it.baseUrl
+    }
 
     private fun resolveRedirectBaseUrl(): String? = runCatching {
         noRedirectClient.newCall(GET("https://${domainHost(domainNumber)}", headers)).execute().use { response ->
@@ -472,9 +466,7 @@ private const val PREF_LATEST_DOMAIN_URL = "latest_domain_url"
 private const val PREF_LATEST_DOMAIN_FETCHED_AT = "latest_domain_fetched_at"
 private const val PREF_LATEST_DOMAIN_ATTEMPTED_AT = "latest_domain_attempted_at"
 private const val PREF_LATEST_DOMAIN_SOURCE = "latest_domain_source"
-private const val LATEST_DOMAIN_ENDPOINT = "https://a14c.com/"
 private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
-private const val SOURCE_OFFICIAL_PORTAL = "공식 안내 사이트"
 private const val SOURCE_NUMBERED_PROBE = "번호형 주소 확인"
 private const val SOURCE_LEGACY_CACHE = "기존 자동 캐시"
 private const val SOURCE_BUILD_DEFAULT = "빌드 기본 주소"
