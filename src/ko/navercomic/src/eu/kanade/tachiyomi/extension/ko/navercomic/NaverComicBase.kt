@@ -25,7 +25,10 @@ abstract class NaverComicBase(protected val mType: String) : HttpSource() {
 
     protected open val dateFormat = SimpleDateFormat("yy.MM.dd", Locale.KOREA)
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET("$baseUrl/api/search/$mType?keyword=$query&page=$page", headers)
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET(
+        naverSearchUrl(baseUrl, mType, query, page),
+        headers,
+    )
 
     override fun searchMangaParse(response: Response): MangasPage {
         val result = response.parseAs<ApiMangaSearchResponse>()
@@ -116,3 +119,8 @@ abstract class NaverComicChallengeBase(mType: String) : NaverComicBase(mType) {
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 }
+
+internal fun naverSearchUrl(baseUrl: String, type: String, query: String, page: Int) = "$baseUrl/api/search/$type".toHttpUrl().newBuilder()
+    .addQueryParameter("keyword", query)
+    .addQueryParameter("page", page.toString())
+    .build()

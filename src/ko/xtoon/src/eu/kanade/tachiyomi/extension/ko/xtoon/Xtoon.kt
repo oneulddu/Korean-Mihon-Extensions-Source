@@ -19,546 +19,256 @@ import keiyoushi.utils.SharedPreferencesBaseUrlStorage
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.normalizeBaseUrl
 import keiyoushi.utils.rewriteBaseUrl
-import keiyoushi.utils.shouldInvalidateNumberedDomainCache
-import keiyoushi.utils.tryParse
-import okhttp3.Headers
-import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
-import org.jsoup.nodes.Element
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
+import rx.Observable
+import rx.schedulers.Schedulers
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 class Xtoon :
     HttpSource(),
     ConfigurableSource {
-
     override val name = "Xtoon"
-
     override val lang = "ko"
-
-    private val defaultBaseUrl = "https://t4.xtoon365.com"
-
-    override val baseUrl: String
-        get() = getManualBaseUrl() ?: defaultBaseUrl
-
     override val supportsLatest = true
-
     private val preferences: SharedPreferences by getPreferencesLazy()
 
-    override val client = network.cloudflareClient.newBuilder()
-        .addInterceptor { chain ->
-            val originalRequest = chain.request()
-            val cdnRewrittenRequest = if (originalRequest.url.host == SOURCE_CDN_HOST) {
-                originalRequest.newBuilder()
-                    .url(originalRequest.url.newBuilder().host(WORKING_CDN_HOST).build())
-                    .build()
-            } else {
-                originalRequest
-            }
-            val manualBaseUrl = getManualBaseUrl()?.toHttpUrl()
-            val isAutomaticHost = cdnRewrittenRequest.url.host.matches(AUTOMATIC_HOST_REGEX)
-            val isManualHost = manualBaseUrl != null && cdnRewrittenRequest.url.host == manualBaseUrl.host
-            val resolvedBaseUrl = when {
-                !isAutomaticHost && !isManualHost -> null
-                manualBaseUrl != null -> manualBaseUrl.toString()
-                else -> latestBaseUrlResolver.resolve()
-            }
-            val request = if (resolvedBaseUrl != null) {
-                cdnRewrittenRequest.rewriteBaseUrl(resolvedBaseUrl) { host ->
-                    host.matches(AUTOMATIC_HOST_REGEX) || host == manualBaseUrl?.host
-                }
-            } else {
-                cdnRewrittenRequest
-            }
-            val requestBuilder = request.newBuilder()
-                .removeHeader("rsc")
-                .removeHeader("next-router-state-tree")
-                .removeHeader("next-url")
+    // UI callers (including WebView URL getters) never trigger network discovery.
+    override val baseUrl: String
+        get() = manualBaseUrl() ?: latestBaseUrlResolver.cachedBaseUrl() ?: DEFAULT_URL
 
-            if (request.header("Accept") == null) {
-                requestBuilder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            }
+    private val lookupClient = network.client.newBuilder()
+        .followRedirects(false).followSslRedirects(false)
+        .connectTimeout(8, TimeUnit.SECONDS).readTimeout(8, TimeUnit.SECONDS)
+        .callTimeout(8, TimeUnit.SECONDS).build()
 
-            chain.proceed(requestBuilder.build())
-        }
-        .build()
-
-    private val domainLookupClient = network.client.newBuilder()
-        .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .build()
-
-    private val noRedirectClient = network.client.newBuilder()
-        .followRedirects(false)
-        .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .build()
-
+    private val discovery by lazy { XtoonDomainDiscovery(lookupClient) }
     private val latestBaseUrlResolver by lazy {
-        migrateAutomaticBaseUrlCache()
+        if (!preferences.getBoolean("newxtoon_discovery_v1", false)) {
+            preferences.edit().putBoolean("newxtoon_discovery_v1", true)
+                .remove("latest_base_url_fetched_at").remove("latest_base_url_attempted_at").apply()
+        }
         DynamicBaseUrlResolver(
             storage = SharedPreferencesBaseUrlStorage(preferences),
-            keys = BaseUrlCacheKeys(
-                cachedUrl = PREF_LATEST_BASE_URL,
-                fetchedAt = PREF_LATEST_BASE_URL_FETCHED_AT,
-                attemptedAt = PREF_LATEST_BASE_URL_ATTEMPTED_AT,
-            ),
-            fallbackBaseUrl = { defaultBaseUrl },
-            isAllowedAutomaticUrl = ::isAllowedAutomaticUrl,
-            discoverBaseUrl = ::fetchLatestBaseUrl,
-            redirectBaseUrl = ::resolveRedirectBaseUrl,
+            keys = BaseUrlCacheKeys("latest_base_url", "latest_base_url_fetched_at", "latest_base_url_attempted_at"),
+            fallbackBaseUrl = { DEFAULT_URL },
+            isAllowedAutomaticUrl = { isXtoonAutomaticHost(it.host) },
+            discoverBaseUrl = {
+                discovery.discover()?.also {
+                    preferences.edit().putString("latest_base_url_source", it.source).apply()
+                }?.baseUrl
+            },
+            redirectBaseUrl = ::redirectBaseUrl,
         )
     }
 
-    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
+    override val client = network.cloudflareClient.newBuilder().addInterceptor { chain ->
+        val original = chain.request()
+        val manual = manualBaseUrl()?.toHttpUrl()
+        val ownHost: (String) -> Boolean = { isXtoonAutomaticHost(it) || it == manual?.host }
+        val request = if (ownHost(original.url.host)) {
+            val target = manual?.toString() ?: latestBaseUrlResolver.resolve()
+            val rewritten = original.rewriteBaseUrl(target, ownHost)
+            rewritten.newBuilder().header("Origin", target.trimEnd('/'))
+                .header("Referer", rewritten.header("Referer") ?: target.trimEnd('/') + "/").build()
+        } else {
+            original
+        }
+        chain.proceed(request)
+    }.build()
 
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).apply {
-        timeZone = TimeZone.getTimeZone("Asia/Seoul")
-    }
+    override fun headersBuilder() = super.headersBuilder().set("Referer", "$baseUrl/")
 
-    override fun popularMangaRequest(page: Int): Request = GET(categoryUrl(page, order = "hits"), headers)
-
-    override fun popularMangaParse(response: Response): MangasPage = mangaPageParse(response)
-
-    override fun latestUpdatesRequest(page: Int): Request = GET(categoryUrl(page, order = "addtime"), headers)
-
-    override fun latestUpdatesParse(response: Response): MangasPage = mangaPageParse(response)
-
+    override fun popularMangaRequest(page: Int) = GET(browseUrl(page, popular = true), headers)
+    override fun latestUpdatesRequest(page: Int) = GET(browseUrl(page), headers)
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = if (query.isNotBlank()) {
-            baseUrl.toHttpUrl().newBuilder()
-                .addPathSegments("index.php/search")
-                .addQueryParameter("key", query.trim())
-                .build()
-                .toString()
-        } else {
-            val theme = filters.filterIsInstance<ThemeFilter>().firstOrNull()?.selectedValue ?: "300"
-            val order = filters.filterIsInstance<SortFilter>().firstOrNull()?.selectedValue ?: "addtime"
-            val finish = filters.filterIsInstance<StatusFilter>().firstOrNull()?.selectedValue.orEmpty()
-            val weekday = filters.filterIsInstance<WeekdayFilter>().firstOrNull()?.selectedValue.orEmpty()
-            val genre = filters.filterIsInstance<GenreFilter>().firstOrNull()?.selectedValue.orEmpty()
-            val tag = genre.ifBlank { weekday }
-            categoryUrl(page, theme, order, finish, tag)
+        if (query.isNotBlank()) {
+            return GET(
+                baseUrl.toHttpUrl().newBuilder().addPathSegment("search")
+                    .addQueryParameter("q", query.trim()).addQueryParameter("page", page.toString()).build(),
+                headers,
+            )
         }
-
-        return GET(url, headers)
+        val url = browseUrl(page).toHttpUrl().newBuilder()
+        filters.filterIsInstance<UrlFilter>().forEach { filter ->
+            filter.value.takeIf(String::isNotEmpty)?.let { url.addQueryParameter(filter.parameter, it) }
+        }
+        return GET(url.build(), headers)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage = mangaPageParse(response)
+    private fun browseUrl(page: Int, popular: Boolean = false): String = baseUrl.toHttpUrl().newBuilder()
+        .addPathSegment("comics").apply { if (popular) addQueryParameter("sort", "popular") }
+        .addQueryParameter("page", page.toString()).build().toString()
 
-    private fun categoryUrl(page: Int, theme: String = "300", order: String = "addtime", finish: String = "", tag: String = ""): String = buildString {
-        append(baseUrl)
-        append("/category/theme/")
-        append(theme)
-        if (finish.isNotBlank()) {
-            append("/finish/")
-            append(finish)
-        }
-        if (tag.isNotBlank()) {
-            append("/tags/")
-            append(tag)
-        }
-        append("/order/")
-        append(order)
-        if (page > 1) {
-            append("/page/")
-            append(page)
-            append("?ajax=1")
-        }
+    override fun popularMangaParse(response: Response): MangasPage {
+        val page = NewXtoonParser.mangaPage(response.asJsoup())
+        return MangasPage(page.mangas.map { it.toManga() }, page.hasNextPage)
     }
+    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
+    override fun searchMangaParse(response: Response) = popularMangaParse(response)
+    override fun mangaDetailsParse(response: Response) = NewXtoonParser.details(response.asJsoup()).toManga()
 
-    private fun mangaPageParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val mangas = document.select("a[href^=/comic/]:has(img)")
-            .distinctBy { it.attr("href") }
-            .mapNotNull { element ->
-                val href = element.attr("href")
-                val title = element.selectFirst("img")?.attr("alt")
-                    ?: element.selectFirst("h6")?.ownText()
-                    ?: element.text()
-                if (title.isBlank()) return@mapNotNull null
+    override fun fetchMangaDetails(manga: SManga): Observable<SManga> = Observable.defer {
+        super.fetchMangaDetails(resolvedManga(manga))
+    }.subscribeOn(Schedulers.io())
 
-                SManga.create().apply {
-                    this.title = title.trim()
-                    setUrlWithoutDomain(element.absUrl("href"))
-                    thumbnail_url = element.selectFirst("img")?.imageUrl()
-                }
-            }
-
-        val hasNextPage = if (response.request.url.encodedPath.contains("/index.php/search")) {
-            false
-        } else if (response.request.url.queryParameter("ajax") == "1") {
-            mangas.isNotEmpty()
-        } else {
-            val maxPage = Regex("""maxpage\s*=\s*(\d+)""").find(document.html())?.groupValues?.get(1)?.toIntOrNull()
-            maxPage == null || response.request.url.pathSegments.lastOrNull()?.toIntOrNull()?.let { it < maxPage } ?: mangas.isNotEmpty()
-        }
-
-        return MangasPage(mangas, hasNextPage)
-    }
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-        val info = document.selectFirst(".katoon-info")
-
-        return SManga.create().apply {
-            title = info?.selectFirst("h4")?.ownText()?.trim().orEmpty()
-            author = info?.selectFirst("h4 + .small")?.text()?.trim().orEmpty()
-            description = info?.selectFirst("small")?.text()?.trim()
-            genre = info?.select(".tags a")?.joinToString { it.text().removePrefix("#") }
-            thumbnail_url = info?.selectFirst("#toon-img img")?.imageUrl()
-            status = when {
-                document.select(".chapter-list-item strong").any { it.text().contains("최종화") } -> SManga.COMPLETED
-                else -> SManga.UNKNOWN
-            }
-        }
-    }
+    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.defer {
+        super.fetchChapterList(resolvedManga(manga))
+    }.subscribeOn(Schedulers.io())
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
-        return document.select(".chapter-list a[href^=/chapter/]").map { element ->
+        val index = NewXtoonParser.chapterIndex(response.asJsoup())
+        return NewXtoonParser.allChapters(index) { page ->
+            val url = index.apiUrl.newBuilder().addQueryParameter("page", page.toString()).build()
+            client.newCall(
+                GET(
+                    url,
+                    headers.newBuilder().set("Accept", "application/json")
+                        .set("Referer", response.request.url.toString()).build(),
+                ),
+            ).execute().use {
+                if (!it.isSuccessful) throw IOException("회차 목록 요청 실패: HTTP ${it.code}")
+                NewXtoonParser.chapterBatch(it.body.string(), index.apiUrl)
+            }
+        }.map { chapter ->
             SChapter.create().apply {
-                setUrlWithoutDomain(element.absUrl("href"))
-                name = element.selectFirst("strong")?.ownText()?.trim()?.ifBlank { null }
-                    ?: element.selectFirst("strong")?.text()?.substringBefore("P")?.trim()
-                    ?: element.text().trim()
-                date_upload = dateFormat.tryParse(element.selectFirst("small")?.text().orEmpty())
+                url = chapter.url
+                name = chapter.name
+                date_upload = chapter.date_upload
             }
         }
     }
 
-    override fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + chapter.url, headersBuilder().set("Referer", baseUrl + chapter.url).build())
+    override fun pageListRequest(chapter: SChapter): Request {
+        val path = chapter.url.toHttpUrlOrNull()?.encodedPath ?: chapter.url
+        if (!NewXtoonParser.chapterPath.matches(path)) {
+            throw IOException("이전 엑스툰 회차 주소입니다. 작품의 회차 목록을 새로고침한 뒤 다시 열어 주세요.")
+        }
+        return GET(baseUrl + path, headers.newBuilder().set("Referer", baseUrl + path).build())
+    }
 
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        return document.select("img.lazy-read[data-original]").mapIndexed { index, element ->
-            Page(index, imageUrl = element.absUrl("data-original").toWorkingImageUrl())
+    override fun pageListParse(response: Response) = NewXtoonParser.pages(response.asJsoup())
+    override fun imageRequest(page: Page): Request = GET(
+        page.imageUrl!!,
+        headers.newBuilder()
+            .set("Referer", page.url).set("Origin", page.url.toHttpUrl().let { "${it.scheme}://${it.host}" }).build(),
+    )
+    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
+    private fun XtoonManga.toManga(): SManga = SManga.create().also {
+        it.url = url
+        it.title = title
+        it.thumbnail_url = thumbnail_url
+        it.author = author
+        it.description = description
+        it.genre = genre
+        it.status = status
+    }
+
+    private val migrationLock = Any()
+
+    private fun resolvedManga(manga: SManga): SManga {
+        val path = manga.url.toHttpUrlOrNull()?.encodedPath ?: manga.url
+        if (NewXtoonParser.comicPath.matches(path)) return manga
+        if (!Regex("/comic/[0-9]+").matches(path)) throw IOException("지원하지 않는 작품 주소입니다. 소스 이전 기능으로 새 작품을 선택해 주세요.")
+        return synchronized(migrationLock) {
+            val key = "newxtoon_manga_$path"
+            val cached = preferences.getString(key, null)?.takeIf(NewXtoonParser.comicPath::matches)
+            val resolved = cached ?: resolveLegacyTitle(manga).also { preferences.edit().putString(key, it).apply() }
+            SManga.create().apply {
+                url = resolved
+                title = manga.title
+            }
         }
     }
 
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+    private fun resolveLegacyTitle(manga: SManga): String {
+        if (manga.title.isBlank()) throw IOException("이전 작품 제목이 없습니다. 소스 이전 기능으로 새 작품을 선택해 주세요.")
+        // IDs from the old service have no verified correspondence with the new database.
+        // Never transplant a numeric ID. Search all returned pages and require one exact title.
+        val matches = linkedMapOf<String, SManga>()
+        for (page in 1..100) {
+            val result = client.newCall(searchMangaRequest(page, manga.title, FilterList())).execute().use {
+                if (!it.isSuccessful) throw IOException("이전 작품 검색 실패: HTTP ${it.code}")
+                searchMangaParse(it)
+            }
+            result.mangas.filter { NewXtoonParser.normalizedTitle(it.title) == NewXtoonParser.normalizedTitle(manga.title) }
+                .forEach { matches[it.url] = it }
+            if (matches.size > 1) break
+            if (result.hasNextPage) continue
+            val candidate = matches.values.singleOrNull() ?: break
+            val detail = client.newCall(mangaDetailsRequest(candidate)).execute().use {
+                if (!it.isSuccessful) throw IOException("이전 작품 상세 확인 실패: HTTP ${it.code}")
+                mangaDetailsParse(it)
+            }
+            if (NewXtoonParser.normalizedTitle(detail.title) != NewXtoonParser.normalizedTitle(manga.title)) break
+            val oldAuthors = manga.author.orEmpty().split(',').map(String::trim).filter(String::isNotEmpty)
+            val newAuthors = detail.author.orEmpty().split(',').map(String::trim)
+            if (oldAuthors.isNotEmpty() && oldAuthors.none { it in newAuthors }) break
+            return candidate.url
+        }
+        throw IOException("이전 작품을 하나로 확인할 수 없습니다. Mihon의 소스 이전 기능으로 새 작품을 선택해 주세요.")
+    }
+
+    override fun getMangaUrl(manga: SManga): String {
+        val path = manga.url.toHttpUrlOrNull()?.encodedPath ?: manga.url
+        val cached = preferences.getString("newxtoon_manga_$path", null)?.takeIf(NewXtoonParser.comicPath::matches)
+        return baseUrl + (cached ?: path)
+    }
+
+    private fun manualBaseUrl(): String? = preferences.getString("manual_base_url", null)?.let(::normalizeBaseUrl)
+
+    private fun redirectBaseUrl(): String? = runCatching {
+        val current = preferences.getString("latest_base_url", null)
+            ?.let { normalizeBaseUrl(it) { url -> isXtoonAutomaticHost(url.host) } } ?: DEFAULT_URL
+        lookupClient.newCall(GET(current)).execute().use { response ->
+            val url = when {
+                response.code in 300..399 -> response.header("Location")?.let(response.request.url::resolve)
+                response.isSuccessful -> response.request.url
+                else -> null
+            }
+            url?.let { normalizeBaseUrl(it.toString()) { candidate -> isXtoonAutomaticHost(candidate.host) } }
+                ?.also { preferences.edit().putString("latest_base_url_source", "콘텐츠 주소 리다이렉트").apply() }
+        }
+    }.getOrNull()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
-            key = PREF_MANUAL_BASE_URL
-            title = "Override BaseUrl"
-            summary = baseUrlPreferenceSummary()
+            key = "manual_base_url"
+            title = "접속 주소 직접 설정"
+            summary = preferenceSummary()
             setDefaultValue("")
-            dialogMessage = "비워두면 공식 최신주소 페이지와 번호형 주소 리다이렉트에서 자동 확인합니다."
-            setOnPreferenceChangeListener { preference, newValue ->
-                val value = (newValue as? String).orEmpty().trim()
-                if (value.isEmpty()) {
-                    preferences.edit().remove(PREF_MANUAL_BASE_URL).apply()
-                    (preference as EditTextPreference).text = ""
-                    preference.summary = baseUrlPreferenceSummary()
-                    return@setOnPreferenceChangeListener false
-                }
-
-                val normalized = normalizeBaseUrl(value) ?: return@setOnPreferenceChangeListener false
-                preferences.edit().putString(PREF_MANUAL_BASE_URL, normalized).apply()
+            dialogMessage = "https://로 시작하는 전체 기본 주소를 입력하세요. 비우면 공식 주소 안내와 채널에서 자동 확인합니다."
+            setOnPreferenceChangeListener { preference, value ->
+                val input = (value as? String).orEmpty().trim()
+                val normalized = if (input.isEmpty()) "" else normalizeBaseUrl(input) ?: return@setOnPreferenceChangeListener false
+                preferences.edit().putString(key, normalized).apply()
                 (preference as EditTextPreference).text = normalized
-                preference.summary = "현재 수동 주소: $normalized"
+                preference.summary = preferenceSummary()
                 false
             }
         }.also(screen::addPreference)
     }
 
-    override fun getFilterList(): FilterList = FilterList(
-        ThemeFilter(),
-        SortFilter(),
-        StatusFilter(),
-        WeekdayFilter(),
-        GenreFilter(),
-        Filter.Header("요일과 장르를 동시에 고르면 장르가 우선 적용됩니다."),
+    private fun preferenceSummary() = manualBaseUrl()?.let { "현재 수동 주소: $it" }
+        ?: "현재 자동 주소: $baseUrl\n탐색 출처: ${preferences.getString("latest_base_url_source", "공식 주소 안내 → 공식 채널 → 리다이렉트")}"
+
+    override fun getFilterList() = FilterList(
+        UrlFilter("분류", "category", arrayOf("일반만화" to "", "BL·GL" to "BL·GL", "성인만화" to "성인")),
+        UrlFilter("정렬", "sort", arrayOf("최신" to "", "인기" to "popular")),
+        UrlFilter("상태", "status", arrayOf("전체" to "", "연재중" to "연재중", "완결" to "완결")),
+        UrlFilter("요일", "weekday", arrayOf("전체" to "", "월" to "월", "화" to "화", "수" to "수", "목" to "목", "금" to "금", "토" to "토", "일" to "일")),
+        UrlFilter("장르", "genre", arrayOf("전체" to "", "로맨스" to "1", "드라마" to "4", "판타지" to "2", "액션" to "3", "개그/코미디" to "6", "로맨스판타지" to "2739", "무협/사극" to "2743")),
     )
 
-    private fun Element.imageUrl(): String? = when {
-        hasAttr("data-original") -> absUrl("data-original")
-        hasAttr("data-src") -> absUrl("data-src")
-        else -> absUrl("src")
-    }.takeIf { it.isNotBlank() && !it.contains("/packs/mccms/empty.png") }
-        ?.toWorkingImageUrl()
-
-    private fun String.toWorkingImageUrl(): String {
-        val url = toHttpUrlOrNull() ?: return this
-        if (url.host != SOURCE_CDN_HOST) return this
-
-        return url.newBuilder()
-            .host(WORKING_CDN_HOST)
-            .build()
-            .toString()
+    private class UrlFilter(name: String, val parameter: String, private val options: Array<Pair<String, String>>) : Filter.Select<String>(name, options.map { it.first }.toTypedArray()) {
+        val value get() = options[state].second
     }
-
-    private fun getManualBaseUrl(): String? = preferences.getString(PREF_MANUAL_BASE_URL, null)
-        ?.let(::normalizeBaseUrl)
-
-    private fun baseUrlPreferenceSummary(): String = getManualBaseUrl()
-        ?.let { "현재 수동 주소: $it" }
-        ?: "현재 자동 주소: ${latestBaseUrlResolver.cachedBaseUrl() ?: defaultBaseUrl}\n" +
-        "탐색 출처: 공식 최신주소 페이지 → 번호형 주소 리다이렉트"
-
-    private fun migrateAutomaticBaseUrlCache() {
-        if (preferences.getString(PREF_DEFAULT_BASE_URL, null) == defaultBaseUrl) return
-
-        val shouldInvalidateCache = shouldInvalidateNumberedDomainCache(
-            cachedBaseUrl = preferences.getString(PREF_LATEST_BASE_URL, null),
-            legacyDomainNumber = null,
-            minimumDomainNumber = DEFAULT_DOMAIN_NUMBER,
-            hostNumberRegex = AUTOMATIC_HOST_NUMBER_REGEX,
-        )
-        preferences.edit().apply {
-            putString(PREF_DEFAULT_BASE_URL, defaultBaseUrl)
-            if (shouldInvalidateCache) {
-                remove(PREF_LATEST_BASE_URL)
-                remove(PREF_LATEST_BASE_URL_FETCHED_AT)
-                remove(PREF_LATEST_BASE_URL_ATTEMPTED_AT)
-            }
-        }.apply()
-    }
-
-    private fun fetchLatestBaseUrl(): String? = runCatching {
-        domainLookupClient.newCall(
-            GET(
-                LATEST_DOMAIN_ENDPOINT,
-                Headers.Builder()
-                    .set("User-Agent", headers["User-Agent"].orEmpty())
-                    .set("Accept", "text/html,application/xhtml+xml")
-                    .set("Cache-Control", "no-cache")
-                    .build(),
-            ),
-        ).execute().use { response ->
-            if (!response.isSuccessful) return@use null
-
-            normalizeBaseUrl(response.request.url.toString(), ::isAllowedAutomaticUrl)
-                ?.let { return@use it }
-
-            response.asJsoup()
-                .select("a[href]")
-                .asSequence()
-                .mapNotNull { it.absUrl("href").toHttpUrlOrNull() }
-                .mapNotNull { normalizeBaseUrl(it.toString(), ::isAllowedAutomaticUrl) }
-                .firstOrNull()
-        }
-    }.getOrNull()
-
-    private fun resolveRedirectBaseUrl(): String? = runCatching {
-        val probeBaseUrl = preferences.getString(PREF_LATEST_BASE_URL, null)
-            ?.let { normalizeBaseUrl(it, ::isAllowedAutomaticUrl) }
-            ?: defaultBaseUrl
-
-        noRedirectClient.newCall(GET(probeBaseUrl, headers)).execute().use { response ->
-            val requestBaseUrl = response.request.url.takeIf(::isValidAutomaticBaseUrl)
-                ?: return@use null
-
-            if (response.code in 300..399) {
-                val redirectUrl = response.header("Location")
-                    ?.let(response.request.url::resolve)
-                    ?: return@use null
-                val redirectedBaseUrl = normalizeBaseUrl(redirectUrl.toString(), ::isAllowedAutomaticUrl)
-                if (redirectedBaseUrl != null) return@use redirectedBaseUrl
-
-                return@use requestBaseUrl
-                    .takeIf { redirectUrl.host == it.host && isAllowedAutomaticRedirect(redirectUrl) }
-                    ?.toString()
-                    ?.trimEnd('/')
-            }
-
-            requestBaseUrl
-                .takeIf { response.isSuccessful }
-                ?.toString()
-                ?.trimEnd('/')
-        }
-    }.getOrNull()
-
-    private fun isAllowedAutomaticUrl(url: HttpUrl): Boolean = url.host.matches(AUTOMATIC_HOST_REGEX)
-
-    private fun isAllowedAutomaticRedirect(url: HttpUrl): Boolean = isAllowedAutomaticUrl(url) &&
-        url.scheme == "https" &&
-        url.port == 443 &&
-        url.username.isEmpty() &&
-        url.password.isEmpty() &&
-        url.query == null &&
-        url.fragment == null
-
-    private fun isValidAutomaticBaseUrl(url: HttpUrl): Boolean = normalizeBaseUrl(
-        url.toString(),
-        ::isAllowedAutomaticUrl,
-    ) != null
 
     private companion object {
-        const val DEFAULT_DOMAIN_NUMBER = 4
-        val AUTOMATIC_HOST_REGEX = Regex("""^t\d+\.xtoon365\.com$""")
-        val AUTOMATIC_HOST_NUMBER_REGEX = Regex("""^t(\d+)\.xtoon365\.com$""")
-        const val LATEST_DOMAIN_ENDPOINT = "https://xn--9t4b31dr7o.com/"
-        const val PREF_MANUAL_BASE_URL = "manual_base_url"
-        const val PREF_DEFAULT_BASE_URL = "automatic_base_url_default"
-        const val PREF_LATEST_BASE_URL = "latest_base_url"
-        const val PREF_LATEST_BASE_URL_FETCHED_AT = "latest_base_url_fetched_at"
-        const val PREF_LATEST_BASE_URL_ATTEMPTED_AT = "latest_base_url_attempted_at"
-        const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
-        const val SOURCE_CDN_HOST = "cdn.xtoon33.com"
-        const val WORKING_CDN_HOST = "xtoon2.b-cdn.net"
-    }
-
-    private class ThemeFilter :
-        UriPartFilter(
-            "분류",
-            arrayOf(
-                Pair("일반웹툰", "300"),
-                Pair("BL&GL", "301"),
-                Pair("성인웹툰", "302"),
-            ),
-        )
-
-    private class SortFilter :
-        UriPartFilter(
-            "정렬",
-            arrayOf(
-                Pair("최신", "addtime"),
-                Pair("인기", "hits"),
-            ),
-        )
-
-    private class StatusFilter :
-        UriPartFilter(
-            "상태",
-            arrayOf(
-                Pair("전체", ""),
-                Pair("연재중", "1"),
-                Pair("완결", "2"),
-            ),
-        )
-
-    private class WeekdayFilter :
-        UriPartFilter(
-            "요일",
-            arrayOf(
-                Pair("전체", ""),
-                Pair("월", "400"),
-                Pair("화", "401"),
-                Pair("수", "402"),
-                Pair("목", "403"),
-                Pair("금", "404"),
-                Pair("토", "405"),
-                Pair("일", "406"),
-            ),
-        )
-
-    private class GenreFilter :
-        UriPartFilter(
-            "장르",
-            arrayOf(
-                Pair("전체", ""),
-                Pair("동양풍", "503"),
-                Pair("액션", "504"),
-                Pair("판타지", "500"),
-                Pair("드라마", "6542"),
-                Pair("로맨스", "6545"),
-                Pair("재회물", "6547"),
-                Pair("인외존재", "6548"),
-                Pair("다정남", "6549"),
-                Pair("순정남", "6550"),
-                Pair("짝사랑남", "6551"),
-                Pair("엉뚱발랄녀", "6552"),
-                Pair("털털녀", "6553"),
-                Pair("달달물", "6554"),
-                Pair("로맨틱코미디", "6555"),
-                Pair("학원", "6557"),
-                Pair("트라우마", "6558"),
-                Pair("계약관계", "6560"),
-                Pair("일상", "6561"),
-                Pair("아이돌", "6564"),
-                Pair("배우", "6565"),
-                Pair("감성", "6568"),
-                Pair("전쟁", "6569"),
-                Pair("생존", "6570"),
-                Pair("회귀", "6571"),
-                Pair("영지", "6572"),
-                Pair("노력", "6573"),
-                Pair("성장", "6574"),
-                Pair("아티팩트", "6575"),
-                Pair("용병", "6576"),
-                Pair("왕족/귀족", "6577"),
-                Pair("무공", "6578"),
-                Pair("군인", "6579"),
-                Pair("창", "6580"),
-                Pair("만능", "6581"),
-                Pair("2021 지상최대공모전", "6582"),
-                Pair("까칠남", "6583"),
-                Pair("스릴러", "6584"),
-                Pair("서스펜스", "6585"),
-                Pair("BL", "6588"),
-                Pair("로판", "6594"),
-                Pair("개그", "6595"),
-                Pair("정통", "6597"),
-                Pair("퓨전", "6598"),
-                Pair("먼치킨", "6599"),
-                Pair("시스템", "6600"),
-                Pair("조력자", "6601"),
-                Pair("초능력", "6602"),
-                Pair("성인", "6603"),
-                Pair("해외 순정", "6604"),
-                Pair("성인웹툰", "6605"),
-                Pair("해외웹툰", "6606"),
-                Pair("완결", "6607"),
-                Pair("아포칼립스", "6623"),
-                Pair("게임", "6625"),
-                Pair("공포/스릴러", "6631"),
-                Pair("긴장감 있는", "6632"),
-                Pair("궁금하게 하는", "6633"),
-                Pair("범죄스릴러물", "6634"),
-                Pair("옴니버스", "6636"),
-                Pair("집착", "6638"),
-                Pair("애증", "6639"),
-                Pair("느와르", "6640"),
-                Pair("GL", "6641"),
-                Pair("4차원", "6642"),
-                Pair("떡대수", "6644"),
-                Pair("직진수", "6645"),
-                Pair("짝사랑", "6646"),
-                Pair("사내연애", "6647"),
-                Pair("선후배", "6648"),
-                Pair("레드스트링", "6649"),
-                Pair("능욕", "6650"),
-                Pair("폭력", "6651"),
-                Pair("실눈공", "6652"),
-                Pair("강공", "6653"),
-                Pair("난폭공", "6654"),
-                Pair("굴림수", "6655"),
-                Pair("소시오패스", "6656"),
-                Pair("조폭", "6657"),
-                Pair("재벌", "6658"),
-                Pair("후회물", "6659"),
-                Pair("선결혼후연애", "6660"),
-                Pair("머니게임", "6661"),
-                Pair("집착공", "6662"),
-                Pair("순정공", "6663"),
-                Pair("다정수", "6664"),
-                Pair("우정", "6665"),
-                Pair("헌신공", "6666"),
-                Pair("단정수", "6667"),
-                Pair("적극수", "6668"),
-                Pair("순애", "6669"),
-                Pair("연애", "6670"),
-                Pair("일편단심", "6671"),
-                Pair("현대물", "6672"),
-                Pair("잔망수", "6673"),
-                Pair("환생", "6674"),
-                Pair("정령", "6675"),
-                Pair("마계", "6676"),
-                Pair("마법사", "6677"),
-                Pair("정령술사", "6678"),
-                Pair("망나니", "6679"),
-            ),
-        )
-    private abstract class UriPartFilter(displayName: String, private val vals: Array<Pair<String, String>>) : Filter.Select<String>(displayName, vals.map { it.first }.toTypedArray()) {
-        val selectedValue: String
-            get() = vals[state].second
+        const val DEFAULT_URL = "https://newxtoon1.com"
     }
 }

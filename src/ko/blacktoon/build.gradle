@@ -1,8 +1,26 @@
 ext {
     extName = 'BlackToon'
     extClass = '.BlackToon'
-    extVersionCode = 12
+    extVersionCode = 13
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
+    sourceSets {
+        test {
+            java.srcDirs = ['test']
+            kotlin.srcDirs = ['test']
+        }
+    }
+}
+
+dependencies {
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
+}

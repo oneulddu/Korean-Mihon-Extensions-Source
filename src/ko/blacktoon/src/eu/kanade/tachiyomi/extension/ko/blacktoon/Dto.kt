@@ -78,12 +78,16 @@ class Chapter(
             .removeSuffix(".html")
             .ifBlank { "$mangaId/$id" }
         name = title
-        date_upload = try {
-            dateFormat.parse(date)!!.time
-        } catch (_: ParseException) {
-            0L
-        }
+        date_upload = parseBlacktoonChapterDate(date)
     }
 }
 
 private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
+
+internal fun parseBlacktoonChapterDate(date: String): Long = synchronized(dateFormat) {
+    try {
+        dateFormat.parse(date)?.time ?: 0L
+    } catch (_: ParseException) {
+        0L
+    }
+}

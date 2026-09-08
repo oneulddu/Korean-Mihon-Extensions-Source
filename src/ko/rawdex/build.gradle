@@ -3,8 +3,22 @@ ext {
     extClass = '.RawDEX'
     themePkg = 'madara'
     baseUrl = 'https://rawdex.net'
-    overrideVersionCode = 3
+    overrideVersionCode = 4
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    sourceSets {
+        test {
+            java.srcDirs = ['test']
+            kotlin.srcDirs = ['test']
+        }
+    }
+}
+
+dependencies {
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
+}

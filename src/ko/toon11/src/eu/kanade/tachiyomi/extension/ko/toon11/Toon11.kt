@@ -43,12 +43,12 @@ class Toon11 :
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
-    override fun popularMangaRequest(page: Int) = GET("$baseUrl/bbs/board.php?bo_table=toon_c&is_over=0", headers)
+    override fun popularMangaRequest(page: Int) = GET(toon11PopularUrl(baseUrl, page), headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val mangas = document.select("li[data-id]").mapNotNull(::popularMangaFromElement)
-        val hasNextPage = document.selectFirst(".pg_end") != null
+        val hasNextPage = hasToon11NextPage(document, response.request.url)
         return MangasPage(mangas, hasNextPage)
     }
 
@@ -57,15 +57,12 @@ class Toon11 :
     override fun latestUpdatesParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val mangas = document.select("li[data-id]").mapNotNull(::popularMangaFromElement)
-        val hasNextPage = document.selectFirst(".pg_end") != null
+        val hasNextPage = hasToon11NextPage(document, response.request.url)
         return MangasPage(mangas, hasNextPage)
     }
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = if (query.isNotBlank()) {
-        val url = "$baseUrl/bbs/search_stx.php".toHttpUrl().newBuilder().apply {
-            addQueryParameter("stx", query)
-        }.build()
-        GET(url, headers)
+        GET(toon11SearchUrl(baseUrl, query, page), headers)
     } else {
         val sortFilter = filters.firstInstanceOrNull<SortFilter>()
         val statusFilter = filters.firstInstanceOrNull<StatusFilter>()
@@ -96,7 +93,7 @@ class Toon11 :
                 thumbnail_url = element.thumbnailUrl()
             }
         }
-        val hasNextPage = document.selectFirst(".pg_end") != null
+        val hasNextPage = hasToon11NextPage(document, response.request.url)
         return MangasPage(mangas, hasNextPage)
     }
 

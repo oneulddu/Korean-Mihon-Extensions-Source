@@ -165,15 +165,49 @@ def normalize_sources(raw_sources: list[dict[str, Any]], default_lang: str) -> l
 
 
 def find_release_apks(source_dir: Path, requested: set[str] | None) -> list[Path]:
-    apks = []
-    for apk in sorted(source_dir.glob("src/*/*/build/outputs/apk/release/tachiyomi-*-v*-release.apk")):
+    latest: dict[tuple[str, str], tuple[int, Path]] = {}
+    for apk in source_dir.glob("src/*/*/build/outputs/apk/release/tachiyomi-*-v*-release.apk"):
         match = APK_RE.match(apk.name)
         if not match:
             continue
-        if requested is not None and match.group("module") not in requested:
+        module = match.group("module")
+        if requested is not None and module not in requested:
             continue
-        apks.append(apk)
-    return apks
+        key = (match.group("lang"), module)
+        code = int(match.group("code"))
+        previous = latest.get(key)
+        if previous is not None and code == previous[0] and apk != previous[1]:
+            raise SystemExit(f"Ambiguous release APKs for {module} version {code}")
+        if previous is None or code > previous[0]:
+            latest[key] = (code, apk)
+    return [latest[key][1] for key in sorted(latest)]
+
+
+def expected_version_code(source_dir: Path, gradle_text: str) -> int:
+    theme = parse_gradle_value(gradle_text, "themePkg")
+    if theme:
+        theme_file = source_dir / "lib-multisrc" / theme / "build.gradle.kts"
+        base_code = parse_gradle_int(theme_file.read_text(encoding="utf-8"), "baseVersionCode")
+        override_code = parse_gradle_int(gradle_text, "overrideVersionCode")
+        if base_code is not None and override_code is not None:
+            return base_code + override_code
+    else:
+        code = parse_gradle_int(gradle_text, "extVersionCode")
+        if code is not None:
+            return code
+    raise SystemExit("Cannot determine extension version code from Gradle configuration")
+
+
+def validate_release_set(source_dir: Path, infos: list[ExtensionInfo], modules: dict[str, tuple[str, Path, str]], requested: set[str]) -> None:
+    missing = requested - {info.module for info in infos}
+    if missing:
+        raise SystemExit(f"Missing release APK(s): {', '.join(sorted(missing))}")
+    for info in infos:
+        module_lang, _, gradle_text = modules[info.module]
+        expected = expected_version_code(source_dir, gradle_text)
+        match = APK_RE.match(info.apk_path.name)
+        if info.version_code != expected or match.group("lang") != module_lang:
+            raise SystemExit(f"Release APK does not match current source for {info.module}: expected {module_lang} version {expected}, found {info.apk_path.name}")
 
 
 def build_extension_info(source_dir: Path, apk_path: Path, modules: dict[str, tuple[str, Path, str]], config: dict[str, Any]) -> ExtensionInfo:
@@ -313,6 +347,7 @@ def main() -> None:
     parser.add_argument("--source-dir", type=Path, default=Path.cwd())
     parser.add_argument("--deploy-dir", type=Path, required=True)
     parser.add_argument("--extensions", default="all", help="all 또는 공백/쉼표로 구분한 모듈명")
+    parser.add_argument("--prune-only", action="store_true", help="APK를 게시하지 않고 삭제된 확장만 인덱스에서 정리")
     parser.add_argument("--replace", action="store_true", help="기존 인덱스를 버리고 이번에 찾은 APK만 반영")
     args = parser.parse_args()
 
@@ -321,11 +356,24 @@ def main() -> None:
     config = read_json(source_dir / "scripts/extensions.json", {"extensions": {}})
     modules = discover_modules(source_dir)
     requested = parse_requested(args.extensions, set(modules))
-    apks = find_release_apks(source_dir, requested)
-    if not apks:
-        raise SystemExit("No release APKs found. Build extensions before updating the deployment repository.")
-
-    infos = [build_extension_info(source_dir, apk, modules, config) for apk in apks]
+    if args.prune_only and (args.replace or requested is not None):
+        raise SystemExit("--prune-only cannot be combined with --replace or a selected extension list")
+    if args.prune_only:
+        if not (deploy_dir / "index.min.json").is_file() or not (deploy_dir / "index.json").is_file():
+            raise SystemExit("--prune-only requires existing deployment indexes")
+        infos = []
+    else:
+        if requested is None:
+            from list_extensions import is_buildable
+            requested = {
+                module for module, (_, module_dir, _) in modules.items()
+                if is_buildable(source_dir, module, module_dir / "build.gradle", config, explicit=False)[0]
+            }
+        apks = find_release_apks(source_dir, requested)
+        if not apks:
+            raise SystemExit("No release APKs found. Build extensions before updating the deployment repository.")
+        infos = [build_extension_info(source_dir, apk, modules, config) for apk in apks]
+        validate_release_set(source_dir, infos, modules, requested)
     infos.sort(key=lambda item: (item.lang, item.name.lower(), item.module))
 
     (deploy_dir / "apk").mkdir(parents=True, exist_ok=True)

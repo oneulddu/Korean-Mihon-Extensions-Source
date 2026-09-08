@@ -1,8 +1,28 @@
 ext {
     extName = 'Xtoon'
     extClass = '.Xtoon'
-    extVersionCode = 6
+    extVersionCode = 7
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+
+android {
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
+    sourceSets {
+        test {
+            java.srcDirs = ['test']
+            kotlin.srcDirs = ['test']
+            resources.srcDirs = ['test/resources']
+        }
+    }
+}
+
+dependencies {
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
+}

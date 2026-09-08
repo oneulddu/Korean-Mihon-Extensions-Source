@@ -4,6 +4,9 @@ import android.content.SharedPreferences
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
+import java.io.IOException
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
 
 interface BaseUrlStorage {
     fun getString(key: String): String?
@@ -54,51 +57,97 @@ class DynamicBaseUrlResolver(
     private val retryDelayMs: Long = DEFAULT_RETRY_DELAY_MS,
 ) {
     private val refreshLock = Any()
+    private var generation = 0L
+    private var inFlight: Refresh? = null
+
+    private data class Refresh(val generation: Long, val task: FutureTask<String>)
 
     fun resolve(): String {
-        val currentTime = now()
-        val cached = cachedBaseUrl()
-        if (cached != null && currentTime - storage.getLong(keys.fetchedAt) < cacheDurationMs) {
-            onAutomaticUrlResolved(cached)
-            return cached
-        }
+        while (true) {
+            var startRefresh = false
+            val refresh = synchronized(refreshLock) {
+                val currentTime = now()
+                val cached = cachedBaseUrl()
+                if (cached != null && isRecent(storage.getLong(keys.fetchedAt), currentTime, cacheDurationMs)) {
+                    return cached.also(onAutomaticUrlResolved)
+                }
 
-        if (currentTime - storage.getLong(keys.attemptedAt) < retryDelayMs) {
-            return (cached ?: normalizedFallback()).also(onAutomaticUrlResolved)
-        }
-
-        return synchronized(refreshLock) {
-            val synchronizedTime = now()
-            val synchronizedCached = cachedBaseUrl()
-            if (
-                synchronizedCached != null &&
-                synchronizedTime - storage.getLong(keys.fetchedAt) < cacheDurationMs
-            ) {
-                onAutomaticUrlResolved(synchronizedCached)
-                return@synchronized synchronizedCached
+                inFlight ?: run {
+                    if (isRecent(storage.getLong(keys.attemptedAt), currentTime, retryDelayMs)) {
+                        return (cached ?: normalizedFallback()).also(onAutomaticUrlResolved)
+                    }
+                    val refreshGeneration = generation
+                    startRefresh = true
+                    Refresh(refreshGeneration, FutureTask { refreshCache(refreshGeneration, cached) })
+                        .also { inFlight = it }
+                }
             }
 
-            if (synchronizedTime - storage.getLong(keys.attemptedAt) < retryDelayMs) {
-                return@synchronized (synchronizedCached ?: normalizedFallback()).also(onAutomaticUrlResolved)
+            // Only the owner performs discovery. Other callers share its result without
+            // holding the state lock, so settings can invalidate an in-flight lookup.
+            if (startRefresh) refresh.task.run()
+            val result = try {
+                refresh.task.get()
+            } catch (error: ExecutionException) {
+                throw error.cause ?: error
+            } finally {
+                synchronized(refreshLock) {
+                    if (refresh.task.isDone && inFlight === refresh) inFlight = null
+                }
             }
-
-            storage.putLong(keys.attemptedAt, synchronizedTime)
-            val discovered = discoverBaseUrl()?.let(::normalizeAutomaticBaseUrl)
-                ?: redirectBaseUrl()?.let(::normalizeAutomaticBaseUrl)
-
-            if (discovered != null) {
-                storage.putString(keys.cachedUrl, discovered)
-                storage.putLong(keys.fetchedAt, synchronizedTime)
+            synchronized(refreshLock) {
+                if (refresh.generation == generation) return result
             }
-
-            (discovered ?: synchronizedCached ?: normalizedFallback()).also(onAutomaticUrlResolved)
         }
     }
+
+    private fun refreshCache(refreshGeneration: Long, previousUrl: String?): String {
+        val discovered = lookup(discoverBaseUrl) ?: lookup(redirectBaseUrl)
+        return synchronized(refreshLock) {
+            if (refreshGeneration != generation) {
+                return@synchronized cachedBaseUrl() ?: normalizedFallback()
+            }
+            val completedAt = now()
+            storage.putLong(keys.attemptedAt, completedAt)
+            if (discovered != null) {
+                storage.putString(keys.cachedUrl, discovered)
+                storage.putLong(keys.fetchedAt, completedAt)
+            }
+            (discovered ?: previousUrl ?: normalizedFallback()).also(onAutomaticUrlResolved)
+        }
+    }
+
+    private fun lookup(discover: () -> String?): String? = try {
+        discover()?.let(::normalizeAutomaticBaseUrl)
+    } catch (error: IOException) {
+        if (Thread.currentThread().isInterrupted) throw error
+        null
+    }
+
+    private fun isRecent(timestamp: Long, currentTime: Long, duration: Long): Boolean = timestamp > 0 && currentTime - timestamp in 0 until duration
 
     fun cachedBaseUrl(): String? = storage.getString(keys.cachedUrl)?.let(::normalizeAutomaticBaseUrl)
 
     fun clearCache() {
-        storage.remove(keys.cachedUrl, keys.fetchedAt, keys.attemptedAt)
+        synchronized(refreshLock) {
+            generation++
+            storage.remove(keys.cachedUrl, keys.fetchedAt, keys.attemptedAt)
+        }
+    }
+
+    /** Accept only a redirect from the address still in use, never a late old response. */
+    fun recordRedirect(fromBaseUrl: String, toBaseUrl: String): Boolean {
+        val from = normalizeAutomaticBaseUrl(fromBaseUrl) ?: return false
+        val target = normalizeAutomaticBaseUrl(toBaseUrl) ?: return false
+        return synchronized(refreshLock) {
+            if (from == target || (cachedBaseUrl() ?: normalizedFallback()) != from) return@synchronized false
+            generation++
+            storage.putString(keys.cachedUrl, target)
+            storage.putLong(keys.fetchedAt, now())
+            storage.putLong(keys.attemptedAt, now())
+            onAutomaticUrlResolved(target)
+            true
+        }
     }
 
     private fun normalizedFallback(): String = normalizeAutomaticBaseUrl(fallbackBaseUrl())
@@ -166,15 +215,18 @@ fun Request.rewriteBaseUrl(
             ?.toHttpUrlOrNull()
             ?.takeIf { shouldRewriteHost(it.host) }
             ?.let { headerUrl ->
-                builder.header(
-                    header,
-                    headerUrl.newBuilder()
-                        .scheme(target.scheme)
-                        .host(target.host)
-                        .port(target.port)
-                        .build()
-                        .toString(),
-                )
+                val rewrittenHeaderUrl = headerUrl.newBuilder()
+                    .scheme(target.scheme)
+                    .host(target.host)
+                    .port(target.port)
+                    .build()
+                val value = if (header == "Origin") {
+                    rewrittenHeaderUrl.newBuilder().encodedPath("/").query(null).fragment(null)
+                        .build().toString().trimEnd('/')
+                } else {
+                    rewrittenHeaderUrl.toString()
+                }
+                builder.header(header, value)
             }
     }
 

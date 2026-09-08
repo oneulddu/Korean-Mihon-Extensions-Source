@@ -1,8 +1,26 @@
 ext {
     extName = 'Naver Comic'
     extClass = '.NaverComicFactory'
-    extVersionCode = 8
+    extVersionCode = 9
     isNsfw = false
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
+    sourceSets {
+        test {
+            java.srcDirs = ['test']
+            kotlin.srcDirs = ['test']
+        }
+    }
+}
+
+dependencies {
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
+}

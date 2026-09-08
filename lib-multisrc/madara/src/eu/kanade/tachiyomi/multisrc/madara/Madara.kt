@@ -818,7 +818,7 @@ abstract class Madara(
     protected open fun imageFromElement(element: Element): String? = when {
         element.hasAttr("data-src") -> element.attr("abs:data-src")
         element.hasAttr("data-lazy-src") -> element.attr("abs:data-lazy-src")
-        element.hasAttr("srcset") -> element.attr("abs:srcset").getSrcSetImage()
+        element.hasAttr("srcset") -> resolveMadaraSrcSetImage(element, element.attr("srcset").getSrcSetImage())
         element.hasAttr("data-cfsrc") -> element.attr("abs:data-cfsrc")
         element.hasAttr("data-manga-src") -> element.attr("abs:data-manga-src")
         else -> element.attr("abs:src")
@@ -827,9 +827,7 @@ abstract class Madara(
     /**
      *  Get the best image quality available from srcset
      */
-    protected open fun String.getSrcSetImage(): String? = this.split(" ")
-        .filter(URL_REGEX::matches)
-        .maxOfOrNull(String::toString)
+    protected open fun String.getSrcSetImage(): String? = selectMadaraSrcSetImage(this)
 
     /**
      *  Apply any additional processing to the thumbnail URL if needed.
@@ -1033,8 +1031,8 @@ abstract class Madara(
         launchIO { countViews(document) }
 
         val chapterProtector = document.selectFirst(chapterProtectorSelector)
-            ?: return document.select(pageListParseSelector).mapIndexed { index, element ->
-                val imageUrl = element.selectFirst("img")?.let { imageFromElement(it) }
+            ?: return selectMadaraPageImages(document, pageListParseSelector).mapIndexed { index, element ->
+                val imageUrl = imageFromElement(element)
                 Page(index, document.location(), imageUrl)
             }
         val chapterProtectorHtml = chapterProtector.attr("src")

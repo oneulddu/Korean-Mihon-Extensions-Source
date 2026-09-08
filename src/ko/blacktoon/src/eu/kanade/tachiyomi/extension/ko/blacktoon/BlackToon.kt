@@ -18,7 +18,6 @@ import keiyoushi.utils.SharedPreferencesBaseUrlStorage
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.normalizeBaseUrl
 import keiyoushi.utils.rewriteBaseUrl
-import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -29,7 +28,6 @@ import okio.IOException
 import rx.Observable
 import uy.kohesive.injekt.injectLazy
 import java.util.concurrent.TimeUnit
-import kotlin.random.Random
 
 class BlackToon :
     HttpSource(),
@@ -41,6 +39,7 @@ class BlackToon :
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
+    @Volatile
     private var currentBaseUrlHost = ""
     override val baseUrl: String
         get() = getManualBaseUrl() ?: "https://blacktoon$domainNumber.com"
@@ -66,13 +65,11 @@ class BlackToon :
             else -> latestBaseUrlResolver.resolve().toHttpUrl()
         }
 
-        if (resolvedBaseUrl != null) {
+        if (resolvedBaseUrl != null && manualBaseUrl == null) {
             currentBaseUrlHost = resolvedBaseUrl.host
         }
         val requestHeaderBaseUrl = resolvedBaseUrl ?: if (originalRequest.url.host == cdnHost) {
-            getManualBaseUrl()?.toHttpUrl()
-                ?: latestBaseUrlResolver.cachedBaseUrl()?.toHttpUrl()
-                ?: "https://${currentBaseUrlHost.ifBlank { domainHost(domainNumber) }}".toHttpUrl()
+            activeBaseUrl().toHttpUrl()
         } else {
             null
         }
@@ -133,78 +130,51 @@ class BlackToon :
 
     private val json by injectLazy<Json>()
 
-    private val db by lazy { synchronized(dbCacheLock) { cachedDb ?: loadDb().also { cachedDb = it } } }
+    private val catalog = BlacktoonCatalog(::loadDb)
+
+    private fun activeBaseUrl(): String = getManualBaseUrl()
+        ?: latestBaseUrlResolver.cachedBaseUrl()
+        ?: "https://${currentBaseUrlHost.ifBlank { domainHost(domainNumber) }}"
 
     private fun loadDb(): List<SeriesItem> {
-        val response = client.newCall(GET(baseUrl, headers)).execute()
-        val body = response.body.string()
-        val dataScriptUrls = dataScriptRegex.findAll(body)
-            .map { it.groupValues[1] }
-            .distinct()
-            .toList()
-            .ifEmpty { throw IOException("unable to find webtoon data scripts") }
-
-        return dataScriptUrls.flatMap { scriptUrl ->
-            var listIdx: Int
-            client.newCall(GET("$baseUrl$scriptUrl", headers))
-                .execute().body.string()
-                .also {
-                    listIdx = it.substringBefore(" = ")
-                        .substringAfter("data")
-                        .toInt()
-                }
-                .substringAfter(" = ")
-                .removeSuffix(";")
-                .let { json.decodeFromString<List<SeriesItem>>(it) }
-                .onEach { it.listIndex = listIdx }
+        val (body, pageUrl) = client.newCall(GET(baseUrl, headers)).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("webtoon data request failed: ${response.code}")
+            response.body.string() to response.request.url.toString()
         }
+        val fetchScript: (String) -> String = { fetchDataScript(it, pageUrl) }
+        return loadBlacktoonDataScripts(blacktoonDataScripts(body, pageUrl, fetchScript), json, fetchScript)
     }
 
-    private fun List<SeriesItem>.getPageChunk(page: Int): MangasPage = MangasPage(
-        mangas = drop((page - 1) * 24).take(24)
-            .map { it.toSManga(cdnUrl) },
-        hasNextPage = page * 24 < size,
-    )
+    private fun dataHeaders(pageUrl: String): Headers = headers.newBuilder()
+        .set("Referer", pageUrl)
+        .set("Origin", pageUrl.toHttpUrl().newBuilder().encodedPath("/").query(null).fragment(null).build().toString().trimEnd('/'))
+        .build()
 
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> = Observable.just(
-        db.sortedByDescending { it.hot }.getPageChunk(page),
-    )
-
-    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = Observable.just(
-        db.sortedByDescending { it.updatedAt }.getPageChunk(page),
-    )
-
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        var list = db
-
-        if (query.isNotBlank()) {
-            val stdQuery = query.trim()
-            list = list.filter {
-                it.name.contains(stdQuery, true) ||
-                    it.author.contains(stdQuery, true)
-            }
-        }
-
-        filters.filterIsInstance<ListFilter>().forEach {
-            list = it.applyFilter(list)
-        }
-
-        return Observable.just(
-            list.getPageChunk(page),
-        )
+    private fun fetchDataScript(url: String, pageUrl: String): String = client.newCall(GET(url, dataHeaders(pageUrl))).execute().use { response ->
+        if (!response.isSuccessful) throw IOException("webtoon data script failed: ${response.code}")
+        response.body.string()
     }
+
+    private fun browse(page: Int, selection: BlacktoonSelection): Observable<MangasPage> = Observable.fromCallable {
+        val (items, hasNextPage) = catalog.page(page, selection)
+        MangasPage(items.map { it.toSManga(cdnUrl) }, hasNextPage)
+    }
+
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> = browse(page, BlacktoonSelection(order = 1))
+
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = browse(page, BlacktoonSelection(order = 0))
+
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> = browse(
+        page,
+        BlacktoonSelection.from(query, filters),
+    )
 
     override fun getFilterList() = getFilters()
 
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl/webtoon/${manga.url}.html#${manga.status}", headers)
 
     override fun getMangaUrl(manga: SManga): String = buildString {
-        if (currentBaseUrlHost.isBlank()) {
-            append(baseUrl)
-        } else {
-            append("https://")
-            append(currentBaseUrlHost)
-        }
+        append(activeBaseUrl())
         append("/webtoon/")
         append(manga.url)
         append(".html")
@@ -214,36 +184,29 @@ class BlackToon :
         val doc = response.asJsoup()
         val mangaId = response.request.url.pathSegments.last().removeSuffix(".html")
 
-        return (runCatching { db.firstOrNull { it.id == mangaId }?.toSManga(cdnUrl) }.getOrNull() ?: SManga.create()).apply {
+        val metadata = try {
+            catalog.items().firstOrNull { it.id == mangaId }?.toSManga(cdnUrl)
+        } catch (error: Exception) {
+            error.rethrowIfBlacktoonCancelled()
+            null
+        }
+        return (metadata ?: SManga.create()).apply {
             description = doc.select("p.mt-2").last()?.text()
             status = response.request.url.fragment?.toIntOrNull() ?: status
         }
     }
 
-    override fun chapterListRequest(manga: SManga): Request {
-        val url = "$baseUrl/data/toonlist/${manga.url}.js?v=${"%.17f".format(Random.nextDouble())}"
-
-        return GET(url, headers)
-    }
+    override fun chapterListRequest(manga: SManga): Request = GET("$baseUrl/webtoon/${manga.url}.html", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val mangaId = response.request.url.pathSegments.last().removeSuffix(".js")
-
-        val data = response.body.string()
-            .substringAfter(" = ")
-            .removeSuffix(";")
-            .let { json.decodeFromString<List<Chapter>>(it) }
-
-        return data.map { it.toSChapter(mangaId) }.reversed()
+        val pageUrl = response.request.url.toString()
+        val mangaId = response.request.url.pathSegments.last().removeSuffix(".html")
+        return blacktoonChapters(response.body.string(), pageUrl, json) { fetchDataScript(it, pageUrl) }
+            .map { it.toSChapter(mangaId) }
     }
 
     override fun getChapterUrl(chapter: SChapter): String = buildString {
-        if (currentBaseUrlHost.isBlank()) {
-            append(baseUrl)
-        } else {
-            append("https://")
-            append(currentBaseUrlHost)
-        }
+        append(activeBaseUrl())
         append("/webtoons/")
         append(chapter.url)
         append(".html")
@@ -252,24 +215,11 @@ class BlackToon :
     override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl/webtoons/${chapter.url}.html", headers)
 
     override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-
-        return document.select("#toon_content_imgs img").mapIndexed { index, element ->
-            val imageUrl = element.attr("data-original")
-                .ifBlank { element.attr("o_src") }
-                .ifBlank { element.attr("src") }
-                .toImageUrl()
-
-            Page(index, imageUrl = imageUrl)
-        }
+        val pageUrl = response.request.url.toString()
+        return blacktoonPages(response.body.string(), pageUrl, cdnUrl, { fetchDataScript(it, pageUrl) })
     }
 
-    private fun String.toImageUrl(): String = when {
-        startsWith("http") -> this
-        startsWith("//") -> "https:$this"
-        startsWith("/") -> "https://$currentBaseUrlHost$this"
-        else -> cdnUrl + this
-    }
+    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, dataHeaders(page.url.ifBlank { activeBaseUrl() }))
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
@@ -308,6 +258,7 @@ class BlackToon :
         ?: "현재 자동 주소: ${latestBaseUrlResolver.cachedBaseUrl() ?: "https://${domainHost(domainNumber)}"}\n" +
         "비워두면 공식 안내 사이트에서 최신 주소를 자동 확인합니다."
 
+    @Volatile
     private var domainNumber = ""
         get() {
             val currentValue = field
@@ -404,16 +355,13 @@ class BlackToon :
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
         private const val PREF_DOMAIN_NUMBER = "domain_number"
         private const val PREF_MANUAL_BASE_URL = "manual_base_url"
-        private const val DEFAULT_DOMAIN_NUMBER = "416"
+        private const val DEFAULT_DOMAIN_NUMBER = "421"
         private const val LATEST_DOMAIN_ENDPOINT = "https://blacktoonurl.net/"
         private const val LATEST_DOMAIN_URL_PREF = "latest_domain_url"
         private const val LEGACY_LATEST_DOMAIN_HOST_PREF = "latest_domain_host"
         private const val LATEST_DOMAIN_FETCHED_AT_PREF = "latest_domain_fetched_at"
         private const val LATEST_DOMAIN_ATTEMPTED_AT_PREF = "latest_domain_attempted_at"
         private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
-        private val dbCacheLock = Any()
-        private var cachedDb: List<SeriesItem>? = null
-        private val dataScriptRegex = Regex("""loadScript\((?:inc_url\+)?['"](/data/webtoon/webtoon_\d+_\d+\.js)""")
         private val domainRegex = Regex("""blacktoon(\d+)\.com""")
         private val domainHostRegex = Regex("""^blacktoon\d+\.com$""")
     }

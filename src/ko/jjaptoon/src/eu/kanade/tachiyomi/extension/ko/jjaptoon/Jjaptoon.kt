@@ -19,7 +19,6 @@ import keiyoushi.utils.DynamicBaseUrlResolver
 import keiyoushi.utils.SharedPreferencesBaseUrlStorage
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.normalizeBaseUrl
-import keiyoushi.utils.rewriteBaseUrl
 import keiyoushi.utils.shouldInvalidateNumberedDomainCache
 import keiyoushi.utils.tryParse
 import okhttp3.Headers
@@ -56,6 +55,8 @@ class Jjaptoon :
     private val noRedirectClient by lazy {
         network.client.newBuilder()
             .followRedirects(false)
+            .followSslRedirects(false)
+            .callTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .build()
@@ -63,6 +64,13 @@ class Jjaptoon :
 
     private val latestBaseUrlResolver by lazy {
         migrateAutomaticBaseUrlCache()
+        if (!preferences.getBoolean("official_guide_discovery_v1", false)) {
+            preferences.edit()
+                .remove(LATEST_DOMAIN_FETCHED_AT_PREF)
+                .remove(LATEST_DOMAIN_ATTEMPTED_AT_PREF)
+                .putBoolean("official_guide_discovery_v1", true)
+                .apply()
+        }
         DynamicBaseUrlResolver(
             storage = SharedPreferencesBaseUrlStorage(preferences),
             keys = BaseUrlCacheKeys(
@@ -76,6 +84,8 @@ class Jjaptoon :
             redirectBaseUrl = ::resolveRedirectBaseUrl,
         )
     }
+
+    private val requestRewriter = JjaptoonRequestRewriter(JJAPTOON_HOST_REGEX)
 
     private val latestDomainInterceptor = Interceptor { chain ->
         chain.proceed(rewriteRequestToLatestDomain(chain.request()))
@@ -402,6 +412,7 @@ class Jjaptoon :
             setOnPreferenceChangeListener { preference, newValue ->
                 val value = (newValue as? String).orEmpty().trim()
                 if (value.isEmpty()) {
+                    requestRewriter.updateManual(getManualBaseUrl())
                     preferences.edit().remove(PREF_MANUAL_BASE_URL).apply()
                     (preference as EditTextPreference).text = ""
                     preference.summary = baseUrlPreferenceSummary()
@@ -410,6 +421,7 @@ class Jjaptoon :
 
                 val normalized = normalizeManualBaseUrl(value)
                     ?: return@setOnPreferenceChangeListener false
+                requestRewriter.updateManual(getManualBaseUrl())
                 preferences.edit().putString(PREF_MANUAL_BASE_URL, normalized).apply()
                 (preference as EditTextPreference).text = normalized
                 preference.summary = "현재 수동 주소: $normalized"
@@ -459,33 +471,16 @@ class Jjaptoon :
         .split('.')
         .fold(0L) { result, part -> result * 1_000L + (part.toLongOrNull() ?: 0L).coerceAtMost(999L) }
 
-    private fun rewriteRequestToLatestDomain(request: Request): Request {
-        if (getManualBaseUrl() != null || !request.url.host.matches(JJAPTOON_HOST_REGEX)) {
-            return request
-        }
+    private fun rewriteRequestToLatestDomain(request: Request): Request = requestRewriter.rewrite(
+        request,
+        getManualBaseUrl(),
+        { latestBaseUrlResolver.resolve() },
+    )
 
-        return request.rewriteBaseUrl(latestBaseUrlResolver.resolve()) { it.matches(JJAPTOON_HOST_REGEX) }
-    }
+    private val domainDiscovery by lazy { JjaptoonDomainDiscovery(noRedirectClient) }
 
-    private fun fetchLatestBaseUrl(): String? = runCatching(::fetchLatestBaseUrlFromPortal).getOrNull()
-
-    private fun fetchLatestBaseUrlFromPortal(): String? = noRedirectClient.newCall(
-        GET(
-            LATEST_DOMAIN_PORTAL,
-            Headers.Builder()
-                .set("Accept", "text/html,application/xhtml+xml")
-                .set("Cache-Control", "no-cache")
-                .build(),
-        ),
-    ).execute().use { response ->
-        automaticRedirectLocation(response)
-            ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_PORTAL_REDIRECT) }
-            ?.let { return@use it }
-        if (!response.isSuccessful) return@use null
-
-        parseJjaptoonLatestBaseUrl(response.body.string(), response.request.url.toString())
-            ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_PORTAL) }
-    }
+    private fun fetchLatestBaseUrl(): String? = domainDiscovery.discover()
+        ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_PORTAL) }
 
     private fun automaticRedirectLocation(response: Response): String? {
         if (response.code !in 300..399) return null
@@ -607,8 +602,7 @@ class Jjaptoon :
         private const val SORT_LATEST = "latest"
         private const val SORT_POPULAR = "popular"
         private const val HOME_PAGINATOR = "comicsPage"
-        private const val SOURCE_OFFICIAL_PORTAL = "공식 포털"
-        private const val SOURCE_OFFICIAL_PORTAL_REDIRECT = "공식 포털 리다이렉트"
+        private const val SOURCE_OFFICIAL_PORTAL = "공식 포털 / 주소 API"
         private const val SOURCE_NUMBERED_PROBE = "번호형 주소 확인"
         private const val SOURCE_LEGACY_CACHE = "기존 자동 캐시"
         private const val SOURCE_BUILD_DEFAULT = "빌드 기본 주소"
@@ -625,7 +619,7 @@ class Jjaptoon :
             "https://jjaptoon005.com",
         )
 
-        private val JJAPTOON_HOST_REGEX = Regex("^(?:www\\.)?jjaptoon\\d{3}\\.com$")
+        private val JJAPTOON_HOST_REGEX = jjaptoonContentHostRegex
         private val JJAPTOON_HOST_NUMBER_REGEX = Regex("^(?:www\\.)?jjaptoon(\\d{3})\\.com$")
         private val ignoredBadges = setOf("완결", "연재", "월", "화", "수", "목", "금", "토", "일")
     }
