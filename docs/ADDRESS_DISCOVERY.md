@@ -64,3 +64,11 @@ Toonkor는 확인된 공식 안내 주소가 없어 이번 브랜치에 포함�
 ## 전체 배포 지시
 
 위 보류 기록 이후 사용자가 미검증 항목까지 포함해 배포를 먼저 진행하도록 지시했다. Xtoon 버전은 7로 올리고 전체 정비와 함께 배포한다. 실제 접속 미검증 상태는 유지하며, 이번 배포 예외의 근거와 범위는 [소스 정비와 검증 기록](CODE_REVIEW.md)에 남긴다.
+
+### 전체 배포 완료 (2026-09-09)
+
+- 소스 커밋: `6143ca507689bee2043c2e65638feb78edd048cb` (`feature/source-consistency-0908`).
+- GitHub Actions [34282416688](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/34282416688): `success`.
+- 배포 저장소 `repo` 커밋: `4d5d6ae198eeb3f02d653950e86357224497d4e6`.
+- 공개 인덱스의 9개 버전 상승, APK 9개의 패키지명·버전·서명, 기존 14개 소스 ID 유지를 모두 확인했다.
+- 배포 성공은 위에 기록한 사이트 접속 실패의 해결을 뜻하지 않는다. Xtoon·Toonkor·NTK Webtoon의 미검증 상태와 일부 작품의 회차 번호 공백은 후속 확인 대상으로 남는다.

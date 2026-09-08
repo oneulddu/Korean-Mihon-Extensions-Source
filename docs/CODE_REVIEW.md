@@ -88,3 +88,11 @@ Xtoon은 새 `/comics`와 `/comics/{id}/chapters/{id}` 구조의 파서까지 �
 - 테스트 성공과 배포 성공은 해당 사이트의 실제 이용 성공을 뜻하지 않는다.
 - 배포 대상 버전: 11toon 1.4.5, BlackToon 1.4.13, Jjaptoon 1.4.16, Naver Comic 1.4.9, NTK 1.4.15, RawDEX 1.4.55, Toonkor 1.4.12, Wolf.com 1.4.13, Xtoon 1.4.7.
 - 짭툰·늑대닷컴은 먼저 배포한 주소 복구 외에 공통 코어 및 소스별 추가 수정이 있어 버전을 다시 올렸다.
+
+### 전체 배포 완료 (2026-09-09)
+
+- 소스 커밋: `6143ca507689bee2043c2e65638feb78edd048cb` (`feature/source-consistency-0908`).
+- GitHub Actions [34282416688](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/34282416688): `success`.
+- 배포 저장소 `repo` 커밋: `4d5d6ae198eeb3f02d653950e86357224497d4e6`.
+- 공개 인덱스의 9개 버전 상승, APK 9개의 패키지명·버전·서명, 기존 14개 소스 ID 유지를 모두 확인했다.
+- 배포 성공은 위에 기록한 사이트 접속 실패의 해결을 뜻하지 않는다. Xtoon·Toonkor·NTK Webtoon의 미검증 상태와 일부 작품의 회차 번호 공백은 후속 확인 대상으로 남는다.
