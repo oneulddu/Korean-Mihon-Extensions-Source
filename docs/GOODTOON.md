@@ -46,3 +46,13 @@
 로컬 화면 증거: `/tmp/goodtoon-mihon-detail-final.png`, `/tmp/goodtoon-mihon-long-final.png`, `/tmp/goodtoon-mihon-viewer.png`, `/tmp/goodtoon-mihon-long-viewer-final.png`, `/tmp/goodtoon-mihon-auto-settings.png`. 이 기록은 대표 작품의 검사이며 모든 작품·모든 페이지의 로딩을 보증하지 않는다.
 
 최종 독립 코드 리뷰에서 이전 수동 주소의 Referer가 남는 경우를 발견해 수정했다. 사이트 요청은 최종 주소로 Referer·Origin을 함께 바꾸고 외부 CDN 요청은 그대로 둔다. 해당 회귀 테스트를 추가하고 변경 모듈의 테스트·빌드를 다시 실행했다.
+
+## 배포 결과
+
+[GitHub Actions 34394080904](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/34394080904)가 소스 커밋 `354ac74c79d748a9093943f59e510068cd04bc3f`의 굿툰만 빌드·배포했다. 배포 저장소 `repo` 브랜치의 커밋은 `1261ad15c77167da28ec37be0d5f8a9a4e761dd9`다.
+
+공개 인덱스는 10개 확장·15개 소스로 확인됐고 기존 9개 확장의 항목은 배포 전과 동일했다. 새 소스 ID는 `1065455645154575522`다. 공개 APK를 다시 다운로드해 패키지명, 버전 1.4.1, versionCode 1과 기존 배포 서명 인증서가 일치하는지 검사했다.
+
+- [굿툰 1.4.1 APK](https://raw.githubusercontent.com/oneulddu/Korean-Mihon-Extensions/repo/apk/tachiyomi-ko.goodtoon-v1.4.1-release.apk)
+- APK SHA-256: `64cec68715bd70bc945c1ecfdcab9a06c98f8192d43f9c0ae8e9d9748ef07a35`
+- 서명 인증서 SHA-256: `b25af02d178fad20ebe739e59336f2ae5e307dcd1375418278e752dba03497cb`
