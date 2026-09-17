@@ -18,7 +18,7 @@ class WolfDomainDiscoveryTest {
     fun usesOfficialChannelWhenGuideFails() {
         val result = discovery { url ->
             if (url == WOLF_GUIDE_URL) throw IOException("reset")
-            Reply(body = """<div class="tgme_widget_message" data-post="wfwf_com/149"><div class="tgme_widget_message_text"><a href="https://wfwf494.com">늑대닷컴</a></div></div>""")
+            Reply(body = """<div class="tgme_widget_message" data-post="wftoon/149"><div class="tgme_widget_message_text"><a href="https://wfwf494.com">늑대닷컴</a></div></div>""")
         }.discover()
         assertEquals("https://wfwf494.com", result?.baseUrl)
         assertEquals("공식 텔레그램 주소 안내", result?.source)
@@ -40,10 +40,10 @@ class WolfDomainDiscoveryTest {
     fun channelUsesNewestMessageAndIgnoresSecondarySiteAndOutsideLinks() {
         val html = """
             <a href="https://wfwf999.com">page chrome</a>
-            <div class="tgme_widget_message" data-post="wfwf_com/149"><div class="tgme_widget_message_text">https://wftoon227.com https://wfwf494.com</div></div>
-            <div class="tgme_widget_message" data-post="wfwf_com/148"><div class="tgme_widget_message_text">https://wfwf493.com</div></div>
+            <div class="tgme_widget_message" data-post="wftoon/149"><div class="tgme_widget_message_text">https://wftoon227.com https://wfwf494.com</div></div>
+            <div class="tgme_widget_message" data-post="wftoon/148"><div class="tgme_widget_message_text">https://wfwf493.com</div></div>
             <div class="tgme_widget_message" data-post="other/999"><div class="tgme_widget_message_text">https://wfwf999.com</div></div>
-            <div class="tgme_widget_message" data-post="wfwf_com/150"><div class="tgme_widget_message_forwarded_from">forwarded</div><div class="tgme_widget_message_text">https://wfwf998.com</div></div>
+            <div class="tgme_widget_message" data-post="wftoon/150"><div class="tgme_widget_message_forwarded_from">forwarded</div><div class="tgme_widget_message_text">https://wfwf998.com</div></div>
         """
         assertEquals("https://wfwf494.com", parseWolfOfficialChannel(html))
         assertNull(parseWolfOfficialChannel("<a href='https://wfwf999.com'>outside</a>"))

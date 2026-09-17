@@ -76,11 +76,12 @@ class GoodToon :
         val request = chain.request()
         val manual = manualBaseUrl()
         val ownHost: (String) -> Boolean = { isGoodToonHost(it) || it == manual?.toHttpUrl()?.host }
-        if (!ownHost(request.url.host)) return@addInterceptor chain.proceed(request)
+        val isImage = isGoodToonImageHost(request.url.host)
+        if (!ownHost(request.url.host) && !isImage) return@addInterceptor chain.proceed(request)
         val automatic = manual ?: resolver.resolve()
         // A setting changed while discovery was in flight still takes priority.
         val target = manualBaseUrl() ?: automatic
-        chain.proceed(request.rewriteGoodToonOrigin(target))
+        chain.proceed(if (isImage) request.rewriteGoodToonImageHeaders(target) else request.rewriteGoodToonOrigin(target))
     }.build()
 
     override fun headersBuilder() = super.headersBuilder().set("Referer", "$baseUrl/")
@@ -192,6 +193,6 @@ class GoodToon :
         val value get() = options[state].second
     }
     companion object {
-        private const val DEFAULT_URL = "https://www.goodtoon003.com"
+        private const val DEFAULT_URL = "https://www.goodtoon004.com"
     }
 }

@@ -2,7 +2,7 @@
 
 - 모듈: `src/ko/goodtoon`, 패키지: `eu.kanade.tachiyomi.extension.ko.goodtoon`
 - Mihon 소스 이름: `굿툰`, 언어: `ko`, 최초 버전: `1.4.1`
-- 기본 주소: `https://www.goodtoon003.com`
+- 기본 주소: `https://www.goodtoon004.com`
 - 성인 콘텐츠가 함께 제공되는 사이트이므로 확장의 18+ 표시를 사용한다.
 
 ## 제공 기능
@@ -56,3 +56,18 @@
 - [굿툰 1.4.1 APK](https://raw.githubusercontent.com/oneulddu/Korean-Mihon-Extensions/repo/apk/tachiyomi-ko.goodtoon-v1.4.1-release.apk)
 - APK SHA-256: `64cec68715bd70bc945c1ecfdcab9a06c98f8192d43f9c0ae8e9d9748ef07a35`
 - 서명 인증서 SHA-256: `b25af02d178fad20ebe739e59336f2ae5e307dcd1375418278e752dba03497cb`
+
+
+## 2026-09-18 표지 요청 헤더 수정
+
+Mihon의 `HttpSource.headers`는 처음 생성한 값을 재사용하므로 도메인이 자동 갱신되거나 수동 주소가 바뀌어도 CDN 표지 요청에 이전 Referer가 남을 수 있었다. 굿툰이 실제 사용하는 `img.goodtoon9001.top` 요청은 이미지 URL을 유지하고 Referer·Origin만 현재 접속 주소로 갱신한다. 뷰어 이미지의 Referer 경로도 보존하며 다른 외부 호스트 요청은 변경하지 않는다. 기본 콘텐츠 주소는 공식 채널의 `goodtoon004.com`으로 갱신했다. 버전은 1.4.2다.
+
+수정 전 현재 목록의 93개 CDN 표지와 대표 화면은 정상 로드되어, 사용자가 겪은 특정 작품의 썸네일 실패까지 재현했다고 판단하지 않았다. JavaScript `onerror` 대체 표지 처리는 이번 변경에 추가하지 않았다. 확인된 오래된 헤더 문제를 수정했고 전체 썸네일 문제가 해결됐다고 확대해서 보고하지 않는다.
+
+기존 API 35 에뮬레이터의 실제 Mihon에서 서명된 수정 APK로 목록 표지와 작품 상세·회차·뷰어 이미지 표시를 확인했다.
+
+- `악역 플레이어는 강해지고 싶다`: 사이트 AJAX와 Mihon 모두 871개 회차, `Missing chapters` 없음. 871화 뷰어 73페이지 중 실제 이미지 표시 확인.
+- `차원이동 레벨업`: 사이트 AJAX와 Mihon 모두 469개 회차. 원본 목록에 393화가 없어 `Missing 1 chapter`가 표시된다. 이번 변경의 누락이 아니므로 회차를 임의 생성하지 않았다. 470화 뷰어 99페이지 중 실제 이미지 표시 확인.
+- 목록 표지 및 뷰어 이미지 요청에서 CDN 주소 보존·현재 Referer/Origin·이전 수동 주소 처리·무관한 외부 호스트 보존 회귀 검사를 통과했다.
+
+화면 증거는 `/tmp/mihon-fixes-0918/goodtoon-after.png`, `goodtoon-detail-final.png`, `goodtoon-viewer-final.png`, `goodtoon-470-viewer.png`에 보관했다. 전체 Spotless, Kotlin 162개(로컬 짭툰 보류 수정과 리뷰 후 추가한 공통 코드 회귀 2개 포함), Python 12개, JavaScript 2개가 통과했다. Astra 독립 리뷰에서 발견한 주소 복구 재시도·본문 읽기 오류 처리 두 건도 수정하고 해당 검사를 다시 통과했다.
