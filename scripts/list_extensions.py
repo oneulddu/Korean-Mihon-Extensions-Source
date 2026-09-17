@@ -78,6 +78,13 @@ def parse_changed_extensions(changed_files: list[str], known: set[str]) -> set[s
     return selected
 
 
+def needs_prune(changed_files: list[str], known: set[str]) -> bool:
+    return any(
+        len(parts := path.split("/")) >= 3 and parts[0] == "src" and parts[2] not in known
+        for path in changed_files
+    )
+
+
 def is_buildable(source_dir: Path, module: str, build_file: Path, config: dict, explicit: bool) -> tuple[bool, str | None]:
     ext_config = config.get("extensions", {}).get(module, {})
     if ext_config.get("build") is False and not explicit:
@@ -99,6 +106,7 @@ def main() -> None:
     parser.add_argument("--changed-to", help="변경 확장을 계산할 대상 커밋")
     parser.add_argument("--gradle-tasks", action="store_true")
     parser.add_argument("--names", action="store_true")
+    parser.add_argument("--needs-prune", action="store_true")
     args = parser.parse_args()
 
     source_dir = args.source_dir.resolve()
@@ -109,11 +117,14 @@ def main() -> None:
     if args.changed_from or args.changed_to:
         if not args.changed_from or not args.changed_to:
             raise SystemExit("--changed-from and --changed-to must be used together")
-        requested = parse_changed_extensions(
-            list_changed_files(source_dir, args.changed_from, args.changed_to),
-            known,
-        )
+        changed_files = list_changed_files(source_dir, args.changed_from, args.changed_to)
+        if args.needs_prune:
+            print("true" if needs_prune(changed_files, known) else "false")
+            return
+        requested = parse_changed_extensions(changed_files, known)
     else:
+        if args.needs_prune:
+            raise SystemExit("--needs-prune requires --changed-from and --changed-to")
         requested = parse_requested(args.extensions, known)
 
     unknown = requested - known

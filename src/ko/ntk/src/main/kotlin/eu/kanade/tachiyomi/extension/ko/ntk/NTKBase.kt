@@ -19,8 +19,11 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.SharedPreferencesBaseUrlStorage
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.normalizeBaseUrl
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.rewriteBaseUrl
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -49,9 +52,7 @@ import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -63,12 +64,16 @@ private class ImageApiRequestException(
     message: String,
 ) : IOException(message)
 
-private data class ClientSigningKey(
+internal data class ClientSigningKey(
     val keyId: String,
+    val origin: String,
+    val fingerprint: String?,
     val privateKey: PrivateKey,
     val expiresAt: Long,
     val serverTimeOffsetMs: Long,
-)
+) {
+    fun isValidFor(origin: String, fingerprint: String?, now: Long, renewalMarginMs: Long): Boolean = this.origin == origin && this.fingerprint == fingerprint && expiresAt > now + renewalMarginMs
+}
 
 abstract class NTKBase(
     override val name: String,
@@ -85,28 +90,43 @@ abstract class NTKBase(
     override val supportsLatest = true
     protected val preferences by getPreferencesLazy()
     private val clientSigningKey = AtomicReference<ClientSigningKey?>(null)
-    private val fingerprintValue = AtomicReference<String?>(null)
-    private val adAcknowledgmentCookie = AtomicReference<String?>(null)
+    private val domain by lazy {
+        NTKDomain(SharedPreferencesBaseUrlStorage(preferences), redirect = ::findRedirectBaseUrl)
+    }
 
-    protected val rootUrl: String
-        get() {
-            val stored = preferences.getString(PREF_DOMAIN_KEY, null)
-            val normalizedStored = normalizeDomainNumber(stored)
-            val previousDefault = preferences.getString(PREF_DOMAIN_DEFAULT_KEY, null)
-            val domainNumber = when {
-                normalizedStored == null -> PREF_DOMAIN_DEFAULT
-                normalizedStored == PREVIOUS_DOMAIN_DEFAULT && previousDefault != PREF_DOMAIN_DEFAULT -> PREF_DOMAIN_DEFAULT
-                else -> normalizedStored
-            }
+    // This getter is also called by Mihon's UI thread; only the interceptor may resolve.
+    protected val rootUrl: String get() = domain.currentUrl()
 
-            if (domainNumber != stored || previousDefault != PREF_DOMAIN_DEFAULT) {
-                preferences.edit()
-                    .putString(PREF_DOMAIN_KEY, domainNumber)
-                    .putString(PREF_DOMAIN_DEFAULT_KEY, PREF_DOMAIN_DEFAULT)
-                    .apply()
+    private val addressClient by lazy {
+        OkHttpClient.Builder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(8, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private fun findRedirectBaseUrl(candidates: List<String>): String? {
+        for (candidate in candidates) {
+            var current = candidate
+            val visited = mutableSetOf<String>()
+            for (hop in 0 until 5) {
+                if (!visited.add(current)) break
+                val next = runCatching {
+                    addressClient.newCall(GET(current)).execute().use { response ->
+                        if (response.isSuccessful) return current
+                        if (response.code !in listOf(301, 302, 303, 307, 308)) return@use null
+                        val location = response.header("Location") ?: return@use null
+                        val target = response.request.url.resolve(location) ?: return@use null
+                        normalizeBaseUrl(target.toString()) { NTKDomain.AUTOMATIC_HOST.matches(it.host) }
+                    }
+                }.getOrNull() ?: break
+                current = next
             }
-            return "https://sbxh$domainNumber.com"
         }
+        return null
+    }
 
     protected open val webViewPath: String get() = contentKind
     override val baseUrl: String get() = "$rootUrl/$webViewPath"
@@ -229,9 +249,9 @@ abstract class NTKBase(
                     const seen = new Set();
                     const images = nodes
                         .map(function(img, index) {
-                            const src = absoluteImageUrl(
-                                img.currentSrc || img.getAttribute("src") || img.getAttribute("data-src") || "",
-                            );
+                            const src = absoluteImageUrl(img.currentSrc) ||
+                                absoluteImageUrl(img.getAttribute("src")) ||
+                                absoluteImageUrl(img.getAttribute("data-src"));
                             const pageMatch = (img.getAttribute("alt") || "").match(/\d+/);
                             return src ? {
                                 src: src,
@@ -274,10 +294,11 @@ abstract class NTKBase(
                 return@Interceptor response
             }
 
+            val finalRequest = response.request
             response.close()
-            loadChapterHtmlWithWebView(cleanRequest)?.let { html ->
+            loadChapterHtmlWithWebView(finalRequest)?.let { html ->
                 return@Interceptor Response.Builder()
-                    .request(cleanRequest)
+                    .request(finalRequest)
                     .protocol(Protocol.HTTP_1_1)
                     .code(200)
                     .message("OK")
@@ -316,29 +337,24 @@ abstract class NTKBase(
         val chapterUrl = request.url.toString()
         val cookieManager = android.webkit.CookieManager.getInstance()
         val attempts = listOf(
-            WebViewImageAttempt(rootUrl, chapterUrl),
+            WebViewImageAttempt(originOf(chapterUrl), chapterUrl),
             WebViewImageAttempt(chapterUrl, chapterUrl, warmUpRoot = false),
         )
 
         attempts.forEach { attempt ->
-            val result = AtomicReference<String?>(null)
-            val completed = AtomicBoolean(false)
-            val latch = CountDownLatch(1)
+            val result = WebViewResult<String>()
             val handler = Handler(Looper.getMainLooper())
             val webViewRef = AtomicReference<WebView?>(null)
 
             fun complete(payload: String) {
-                if (payload.isBlank() || completed.get()) return
+                if (payload.isBlank() || result.completed) return
                 val parsed = runCatching { json.decodeFromString<PageImagesResponse>(payload) }.getOrNull()
                 if (parsed?.images.isNullOrEmpty()) return
-                if (completed.compareAndSet(false, true)) {
-                    result.set(payload)
-                    cookieManager.flush()
-                    latch.countDown()
-                }
+                result.complete(payload)
             }
 
             handler.post {
+                if (result.completed) return@post
                 val webView = WebView(Injekt.get<Application>())
                 webViewRef.set(webView)
                 webView.settings.javaScriptEnabled = true
@@ -367,15 +383,17 @@ abstract class NTKBase(
                 var chapterNavigationStarted = !attempt.warmUpRoot
                 webView.webViewClient = object : WebViewClient() {
                     override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                        if (result.completed) return
                         if (chapterNavigationStarted) view.evaluateJavascript(imageBridgeScript, null)
                         super.onPageStarted(view, url, favicon)
                     }
 
                     override fun onPageFinished(view: WebView, url: String) {
+                        if (result.completed) return
                         if (!chapterNavigationStarted) {
                             chapterNavigationStarted = true
                             handler.postDelayed({
-                                if (!completed.get()) view.loadUrl(attempt.chapterUrl)
+                                if (!result.completed) view.loadUrl(attempt.chapterUrl)
                             }, WEBVIEW_ROOT_WARMUP_DELAY_MS)
                         }
                         view.evaluateJavascript(imageBridgeScript, null)
@@ -386,14 +404,8 @@ abstract class NTKBase(
                 webView.loadUrl(attempt.initialUrl)
             }
 
-            latch.await(WEBVIEW_IMAGE_ATTEMPT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            handler.post {
-                webViewRef.getAndSet(null)?.run {
-                    stopLoading()
-                    destroy()
-                }
-            }
-            result.get()?.let { return it }
+            awaitWebView(result, WEBVIEW_IMAGE_ATTEMPT_TIMEOUT_SECONDS, handler, webViewRef)
+                ?.let { return it }
         }
 
         return null
@@ -410,12 +422,12 @@ abstract class NTKBase(
         request: Request,
         waitForAdAcknowledgment: Boolean = false,
     ): String? {
-        val finalHtml = AtomicReference<String?>(null)
-        val isComplete = AtomicBoolean(false)
-        val latch = CountDownLatch(1)
+        val result = WebViewResult<String>()
         val handler = Handler(Looper.getMainLooper())
+        val webViewRef = AtomicReference<WebView?>(null)
 
         fun completeWith(html: String) {
+            if (result.completed) return
             if (
                 html.isBlank() ||
                 isCloudflareChallengeHtml(html) ||
@@ -423,16 +435,14 @@ abstract class NTKBase(
             ) {
                 return
             }
-            if (isComplete.compareAndSet(false, true)) {
-                android.webkit.CookieManager.getInstance().flush()
-                finalHtml.set(html)
-                latch.countDown()
-            }
+            result.complete(html)
         }
 
         handler.post {
+            if (result.completed) return@post
             val context = Injekt.get<Application>()
             val webView = WebView(context)
+            webViewRef.set(webView)
 
             webView.settings.javaScriptEnabled = true
             webView.settings.domStorageEnabled = true
@@ -457,6 +467,7 @@ abstract class NTKBase(
             )
 
             fun collectHtmlFromPage() {
+                if (result.completed) return
                 webView.evaluateJavascript(
                     """
                         (function() {
@@ -474,6 +485,7 @@ abstract class NTKBase(
 
             webView.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String) {
+                    if (result.completed) return
                     collectHtmlFromPage()
                     handler.postDelayed({ collectHtmlFromPage() }, 3_000)
                     handler.postDelayed({ collectHtmlFromPage() }, 8_000)
@@ -492,9 +504,7 @@ abstract class NTKBase(
             handler.postDelayed({ collectHtmlFromPage() }, 24_000)
         }
 
-        latch.await(28, TimeUnit.SECONDS)
-        android.webkit.CookieManager.getInstance().flush()
-        return finalHtml.get()
+        return awaitWebView(result, 28, handler, webViewRef)
     }
 
     private val headerCleanerInterceptor = Interceptor { chain ->
@@ -510,17 +520,22 @@ abstract class NTKBase(
 
     private val domainUpdateInterceptor = Interceptor { chain ->
         val request = chain.request()
-        val response = chain.proceed(request)
-
-        val finalUrl = response.request.url.toString()
-        val matchResult = """sbxh(\d+)\.com""".toRegex().find(finalUrl)
-
-        if (matchResult != null) {
-            val newDomainNumber = matchResult.groupValues[1]
-            val currentDomainNumber = preferences.getString(PREF_DOMAIN_KEY, PREF_DOMAIN_DEFAULT)
-            if (newDomainNumber != currentDomainNumber) {
-                preferences.edit().putString(PREF_DOMAIN_KEY, newDomainNumber).apply()
-            }
+        if (!domain.ownsHost(request.url.host)) return@Interceptor chain.proceed(request)
+        val target = domain.resolve()
+        val rewritten = request.rewriteBaseUrl(target, domain::ownsHost)
+        if ((request.method != "GET" || request.header("Cookie") != null) && request.url.host != rewritten.url.host) {
+            // Tokens, browser signing keys and ad acknowledgment cookies belong to the
+            // chapter's origin. Reload the chapter instead of replaying them on a new host.
+            throw IOException("NTK address changed; reload the chapter before retrying")
+        }
+        val response = chain.proceed(
+            rewritten.newBuilder()
+                .header("Origin", target)
+                .header("Referer", rewritten.header("Referer") ?: "$target/")
+                .build(),
+        )
+        if (request.method == "GET" && response.isSuccessful && response.priorResponse != null) {
+            domain.recordRedirect(target, originOf(response.request.url.toString()))
         }
         response
     }
@@ -678,41 +693,8 @@ abstract class NTKBase(
     override fun latestUpdatesParse(response: Response): MangasPage {
         val document = response.asJsoup()
 
-        val rscData = document.select("script")
-            .map { it.data() }
-            .firstOrNull { "allCards" in it }
+        val jsonArrayStr = extractAllCards(document.select("script").map { it.data() }, json)
             ?: return MangasPage(emptyList(), false)
-
-        val rawContent = rscData
-            .substringAfter("[1,\"")
-            .substringBeforeLast("\"])")
-
-        val unescaped = rawContent
-            .replace("\\\\", "\\")
-            .replace("\\\"", "\"")
-            .replace("\\/", "/")
-
-        val marker = "\"allCards\":"
-        val markerIdx = unescaped.indexOf(marker)
-        if (markerIdx < 0) return MangasPage(emptyList(), false)
-
-        val arrayStart = markerIdx + marker.length
-        var depth = 0
-        var arrayEnd = arrayStart
-        for (i in arrayStart until unescaped.length) {
-            when (unescaped[i]) {
-                '[' -> depth++
-                ']' -> {
-                    depth--
-                    if (depth == 0) {
-                        arrayEnd = i + 1
-                        break
-                    }
-                }
-            }
-        }
-
-        val jsonArrayStr = unescaped.substring(arrayStart, arrayEnd)
         val cards = json.decodeFromString<List<Work>>(jsonArrayStr)
 
         val seen = mutableSetOf<String>()
@@ -771,25 +753,27 @@ abstract class NTKBase(
         val mangaPath = response.request.url.encodedPath.trimEnd('/')
         val workId = response.request.url.pathSegments.getOrNull(1)
 
-        if (workId != null) {
-            fetchAllEpisodes(workId)?.let { episodes ->
-                val apiChapters = episodesToChapters(mangaPath, episodes)
-                val expectedCount = document.selectFirst(".ep-section-count")?.text()
-                    ?.filter(Char::isDigit)
-                    ?.toIntOrNull()
-                if (expectedCount == null || apiChapters.size == expectedCount) return apiChapters
-            }
-        }
-
-        val totalEpisodes = document.selectFirst(".ep-section-count")?.text()
-            ?.filter(Char::isDigit)
-            ?.toIntOrNull()
-            ?: return initialChapters
-        if (initialChapters.size >= totalEpisodes || initialChapters.isEmpty()) return initialChapters
-
-        return fetchAllChapterPages(mangaPath, totalEpisodes, initialChapters)
-            .takeIf { it.size > initialChapters.size }
-            ?: initialChapters
+        val expectedCount = document.selectFirst(".ep-section-count")?.text()
+            ?.filter(Char::isDigit)?.toIntOrNull()
+        return episodeApiOrHtml(
+            api = {
+                workId?.let(::fetchAllEpisodes)?.let { episodes ->
+                    episodesToChapters(mangaPath, episodes).takeIf {
+                        expectedCount == null || it.size == expectedCount
+                    }
+                }
+            },
+            html = {
+                val total = expectedCount
+                    ?: throw IOException("NTK chapter list incomplete: cannot verify total episode count")
+                val uniqueInitial = initialChapters.distinctBy(SChapter::url)
+                if (uniqueInitial.size == total) {
+                    uniqueInitial
+                } else {
+                    fetchAllChapterPages(mangaPath, total, uniqueInitial)
+                }
+            },
+        )
     }
 
     private fun parseChapterRows(document: org.jsoup.nodes.Document): List<SChapter> = document.select("a.ep-row-v2-link[href]").mapNotNull { element ->
@@ -804,7 +788,7 @@ abstract class NTKBase(
             SChapter.create().apply {
                 setUrlWithoutDomain(href)
                 name = title
-                date_upload = dateFormat.tryParse(element.select(".ep-row-v2-date").text())
+                date_upload = synchronized(dateFormat) { dateFormat.tryParse(element.select(".ep-row-v2-date").text()) }
             }
         }
     }
@@ -815,6 +799,9 @@ abstract class NTKBase(
         initialChapters: List<SChapter>,
     ): List<SChapter> {
         val chapters = initialChapters.toMutableList()
+        if (totalEpisodes !in 0..(MAX_EPISODE_API_PAGES * EPISODES_PER_PAGE)) {
+            throw IOException("NTK chapter list incomplete: invalid total episode count")
+        }
         val totalPages = (totalEpisodes + EPISODES_PER_PAGE - 1) / EPISODES_PER_PAGE
         for (page in 2..totalPages) {
             val pageChapters = fetchChapterPage(mangaPath, page)
@@ -822,9 +809,7 @@ abstract class NTKBase(
             chapters += pageChapters
         }
         return chapters.distinctBy(SChapter::url).also {
-            if (it.size < totalEpisodes) {
-                throw IOException("NTK chapter list incomplete: expected $totalEpisodes, received ${it.size}")
-            }
+            requireCompleteChapters(totalEpisodes, it.size)
         }
     }
 
@@ -849,25 +834,27 @@ abstract class NTKBase(
 
     private fun fetchAllManhwaEpisodes(workId: String): List<Episode> {
         val firstPage = fetchEpisodePage(workId, page = 1)
-        val total = firstPage.total
-        if (total != null && total !in 0..(MAX_EPISODE_API_PAGES * EPISODES_PER_PAGE)) {
+        val total = firstPage.total ?: throw IOException("NTK episode API failed: missing total")
+        if (firstPage.page != null && firstPage.page != 1) {
+            throw IOException("NTK episode API failed: invalid first page")
+        }
+        if (total !in 0..(MAX_EPISODE_API_PAGES * EPISODES_PER_PAGE)) {
             throw IOException("NTK episode API failed: invalid total")
         }
         val totalPages = firstPage.totalPages
-            ?: total?.let { (it + EPISODES_PER_PAGE - 1) / EPISODES_PER_PAGE }
-            ?: 1
+            ?: ((total + EPISODES_PER_PAGE - 1) / EPISODES_PER_PAGE)
         if (totalPages !in 0..MAX_EPISODE_API_PAGES || (totalPages == 0 && firstPage.episodes.isNotEmpty())) {
             throw IOException("NTK episode API failed: invalid total pages")
         }
 
-        val episodes = ArrayList<Episode>(total ?: firstPage.episodes.size)
+        val episodes = ArrayList<Episode>(total)
         episodes += firstPage.episodes
         for (page in 2..totalPages) {
             val payload = fetchEpisodePage(workId, page)
             if (payload.page != null && payload.page != page) {
                 throw IOException("NTK episode API failed: expected page $page, received ${payload.page}")
             }
-            if (payload.total != null && total != null && payload.total != total) {
+            if (payload.total != null && payload.total != total) {
                 throw IOException("NTK episode API failed: total changed while paging")
             }
             if (payload.totalPages != null && payload.totalPages != totalPages) {
@@ -875,7 +862,7 @@ abstract class NTKBase(
             }
             episodes += payload.episodes
         }
-        if (total != null && total != episodes.size) {
+        if (total != episodes.size) {
             throw IOException("NTK episode API failed: expected $total, received ${episodes.size}")
         }
         return episodes
@@ -905,24 +892,10 @@ abstract class NTKBase(
         val seenIds = HashSet<String>(episodes.size)
         return episodes.map { episode ->
             val episodeId = episode.sourceEpisodeId.content.trim()
-            if (
-                episodeId.isEmpty() ||
-                episodeId == "." ||
-                episodeId == ".." ||
-                '/' in episodeId ||
-                '\\' in episodeId ||
-                '?' in episodeId ||
-                '#' in episodeId ||
-                episodeId.any { it.isISOControl() || it.isWhitespace() } ||
-                !seenIds.add(episodeId)
-            ) {
-                throw IOException("NTK episode API failed: invalid or duplicate episode id")
-            }
-
             val title = episode.title?.trim().orEmpty().ifEmpty {
                 episode.epNo?.takeIf { contentKind == "webtoon" }?.let { "${it}화" }.orEmpty()
             }
-            if (title.isEmpty()) throw IOException("NTK episode API failed: missing episode title")
+            validateEpisode(episodeId, title, seenIds)
 
             SChapter.create().apply {
                 url = rootUrl.toHttpUrl().newBuilder()
@@ -981,11 +954,9 @@ abstract class NTKBase(
 
     private fun PageImagesResponse.toPages(chapterUrl: okhttp3.HttpUrl, referer: String): List<Page> {
         val imageUrls = images
-            .sortedWith(compareBy<PageImage> { it.page ?: Int.MAX_VALUE }.thenBy { it.src })
+            .let { orderedImages(it, PageImage::page) }
             .mapNotNull { image ->
-                chapterUrl.resolve(image.src.trim())
-                    ?.takeIf { it.scheme == "https" || it.scheme == "http" }
-                    ?.toString()
+                validImageUrl(chapterUrl, image.src)
             }
             .distinct()
 
@@ -1020,8 +991,7 @@ abstract class NTKBase(
             val cookie = webViewCookieHeader(
                 referer,
                 "nv=$nvCookie",
-                fingerprintCookie(),
-                adAcknowledgmentCookie.get().orEmpty(),
+                fingerprintCookie(referer),
             )
             val signatureHeaders = createClientSignatureHeaders(
                 endpointPath,
@@ -1036,7 +1006,7 @@ abstract class NTKBase(
                 .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
                 .set("Cache-Control", "no-store")
                 .set("Content-Type", "application/json")
-                .set("Origin", rootUrl)
+                .set("Origin", originOf(referer))
                 .set("Referer", referer)
                 .set("User-Agent", userAgent)
                 .set("x-images-client", "viewer-v1")
@@ -1048,7 +1018,7 @@ abstract class NTKBase(
                 .build()
 
             return Request.Builder()
-                .url(rootUrl + endpointPath)
+                .url(originOf(referer) + endpointPath)
                 .headers(requestHeaders)
                 .post(bodyText.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
@@ -1124,12 +1094,12 @@ abstract class NTKBase(
     private fun acknowledgeAds(referer: String): Boolean = runCatching {
         val refererUrl = Request.Builder().url(referer).build().url
         val path = refererUrl.encodedPath
-        val cookie = webViewCookieHeader(referer, fingerprintCookie())
+        val cookie = webViewCookieHeader(referer, fingerprintCookie(referer))
         val signingKey = getClientSigningKey(referer, cookie) ?: return@runCatching false
         val requestHeaders = headers.newBuilder()
             .set("Accept", "application/json")
             .set("Content-Type", "application/json")
-            .set("Origin", rootUrl)
+            .set("Origin", originOf(referer))
             .set("Referer", referer)
             .apply { cookie?.let { set("Cookie", it) } }
             .build()
@@ -1137,7 +1107,7 @@ abstract class NTKBase(
         val challengeBody = json.encodeToString(AdChallengeRequest(path))
         val challenge = client.newCall(
             Request.Builder()
-                .url("$rootUrl/api/ad/challenge")
+                .url("${originOf(referer)}/api/ad/challenge")
                 .headers(requestHeaders)
                 .post(challengeBody.toRequestBody(JSON_MEDIA_TYPE))
                 .build(),
@@ -1159,7 +1129,9 @@ abstract class NTKBase(
                     headers.newBuilder()
                         .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
                         .set("Referer", referer)
-                        .apply { cookie?.let { set("Cookie", it) } }
+                        .apply {
+                            if (originOf(url.toString()) == originOf(referer)) cookie?.let { set("Cookie", it) }
+                        }
                         .build(),
                 ),
             ).execute().use { it.isSuccessful }
@@ -1178,7 +1150,7 @@ abstract class NTKBase(
         )
         client.newCall(
             Request.Builder()
-                .url("$rootUrl/api/ad/ack")
+                .url("${originOf(referer)}/api/ad/ack")
                 .headers(requestHeaders)
                 .post(acknowledgmentBody.toRequestBody(JSON_MEDIA_TYPE))
                 .build(),
@@ -1191,13 +1163,10 @@ abstract class NTKBase(
                 return@use false
             }
 
-            val cookie = "ad_ack=$adAckValue"
-            adAcknowledgmentCookie.set(cookie)
+            // CookieManager alone owns ad_ack, including server expiry, path and deletion.
+            // Do not cache a second value or extend its lifetime with a fabricated Max-Age.
             android.webkit.CookieManager.getInstance().run {
-                setCookie(
-                    rootUrl,
-                    "$cookie; Path=/; Max-Age=$AD_ACK_MAX_AGE_SECONDS; HttpOnly; Secure; SameSite=Lax",
-                )
+                response.headers("Set-Cookie").forEach { setCookie(response.request.url.toString(), it) }
                 flush()
             }
             true
@@ -1245,10 +1214,14 @@ abstract class NTKBase(
 
     private fun getClientSigningKey(referer: String, cookie: String?): ClientSigningKey? {
         val now = System.currentTimeMillis()
-        clientSigningKey.get()?.takeIf { it.expiresAt > now + CLIENT_KEY_RENEWAL_MARGIN_MS }?.let { return it }
+        val origin = originOf(referer)
+        val fingerprint = cookie?.split(';')?.map(String::trim)
+            ?.firstOrNull { it.startsWith("ntk_fp=") }
+        fun ClientSigningKey.isCurrent(): Boolean = isValidFor(origin, fingerprint, System.currentTimeMillis(), CLIENT_KEY_RENEWAL_MARGIN_MS)
+        clientSigningKey.get()?.takeIf { it.isCurrent() }?.let { return it }
 
         return synchronized(clientSigningKey) {
-            clientSigningKey.get()?.takeIf { it.expiresAt > now + CLIENT_KEY_RENEWAL_MARGIN_MS } ?: run {
+            clientSigningKey.get()?.takeIf { it.isCurrent() } ?: run {
                 val keyPair = runCatching {
                     KeyPairGenerator.getInstance("EC").apply {
                         initialize(ECGenParameterSpec("secp256r1"))
@@ -1276,6 +1249,8 @@ abstract class NTKBase(
                 val serverExpiresAt = registration.expiresAt ?: serverNow + CLIENT_KEY_DEFAULT_TTL_MS
                 ClientSigningKey(
                     keyId = keyId,
+                    origin = origin,
+                    fingerprint = fingerprint,
                     privateKey = keyPair.private,
                     expiresAt = now + (serverExpiresAt - serverNow),
                     serverTimeOffsetMs = serverNow - now,
@@ -1292,12 +1267,12 @@ abstract class NTKBase(
         cookie: String?,
     ): ClientKeyRegistrationResponse? = runCatching {
         val request = Request.Builder()
-            .url("$rootUrl/api/client-key/register")
+            .url("${originOf(referer)}/api/client-key/register")
             .headers(
                 headers.newBuilder()
                     .set("Accept", "application/json")
                     .set("Content-Type", "application/json")
-                    .set("Origin", rootUrl)
+                    .set("Origin", originOf(referer))
                     .set("Referer", referer)
                     .apply { cookie?.let { set("Cookie", it) } }
                     .build(),
@@ -1316,26 +1291,20 @@ abstract class NTKBase(
         requestBody: String,
         referer: String,
     ): ClientKeyRegistrationResponse? {
-        val result = AtomicReference<ClientKeyRegistrationResponse?>(null)
-        val completed = AtomicBoolean(false)
-        val latch = CountDownLatch(1)
+        val result = WebViewResult<ClientKeyRegistrationResponse>()
         val handler = Handler(Looper.getMainLooper())
         val webViewRef = AtomicReference<WebView?>(null)
 
         fun completeRegistration(responseBody: String) {
+            if (result.completed) return
             val registration = runCatching {
                 json.decodeFromString<ClientKeyRegistrationResponse>(responseBody)
             }.getOrNull() ?: return
-            if (
-                isValidClientKeyRegistration(registration) &&
-                completed.compareAndSet(false, true)
-            ) {
-                result.set(registration)
-                latch.countDown()
-            }
+            if (isValidClientKeyRegistration(registration)) result.complete(registration)
         }
 
         handler.post {
+            if (result.completed) return@post
             val webView = WebView(Injekt.get<Application>())
             webViewRef.set(webView)
             webView.settings.javaScriptEnabled = true
@@ -1355,7 +1324,8 @@ abstract class NTKBase(
             )
 
             fun submitRegistration() {
-                if (completed.get()) return
+                if (result.completed) return
+                if (runCatching { webView.url?.let(::originOf) }.getOrNull() != originOf(referer)) return
                 webView.evaluateJavascript(
                     """
                         (function() {
@@ -1377,6 +1347,8 @@ abstract class NTKBase(
 
             webView.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String) {
+                    if (result.completed) return
+                    if (runCatching { originOf(url) }.getOrNull() != originOf(referer)) return
                     listOf(1_000L, 3_000L, 6_000L, 9_000L).forEach { delay ->
                         handler.postDelayed(::submitRegistration, delay)
                     }
@@ -1386,10 +1358,33 @@ abstract class NTKBase(
             webView.loadUrl(referer)
         }
 
-        latch.await(CLIENT_KEY_WEBVIEW_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        android.webkit.CookieManager.getInstance().flush()
-        handler.post { webViewRef.getAndSet(null)?.destroy() }
-        return result.get()
+        return awaitWebView(result, CLIENT_KEY_WEBVIEW_TIMEOUT_SECONDS, handler, webViewRef)
+    }
+
+    private fun <T> awaitWebView(
+        result: WebViewResult<T>,
+        timeoutSeconds: Long,
+        handler: Handler,
+        webViewRef: AtomicReference<WebView?>,
+    ): T? = result.await(timeoutSeconds, TimeUnit.SECONDS) {
+        // Each attempt owns its Handler. Cancel creation/navigation/collection callbacks,
+        // then dispose on the UI thread, including when the waiting thread is interrupted.
+        handler.removeCallbacksAndMessages(null)
+        handler.post {
+            handler.removeCallbacksAndMessages(null)
+            webViewRef.getAndSet(null)?.run {
+                try {
+                    stopLoading()
+                    removeJavascriptInterface("TrojanTunnel")
+                    removeJavascriptInterface("NTKHtmlBridge")
+                    removeJavascriptInterface("NTKClientKeyBridge")
+                    webViewClient = WebViewClient()
+                } finally {
+                    destroy()
+                }
+            }
+            android.webkit.CookieManager.getInstance().flush()
+        }
     }
 
     private fun unsignedCoordinate(value: ByteArray): ByteArray {
@@ -1486,7 +1481,7 @@ abstract class NTKBase(
                 .set("Accept", "application/json")
                 .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
                 .set("Cache-Control", "no-store")
-                .set("Origin", rootUrl)
+                .set("Origin", originOf(referer))
                 .set("Referer", referer)
                 .set("User-Agent", userAgent)
                 .apply {
@@ -1495,7 +1490,7 @@ abstract class NTKBase(
                 .build()
 
             return Request.Builder()
-                .url("$rootUrl/api/nv-issue")
+                .url("${originOf(referer)}/api/nv-issue")
                 .headers(requestHeaders)
                 .post("".toRequestBody(null))
                 .build()
@@ -1536,7 +1531,7 @@ abstract class NTKBase(
                 headers.newBuilder()
                     .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
                     .set("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
-                    .set("Referer", rootUrl)
+                    .set("Referer", originOf(referer))
                     .set("User-Agent", userAgent)
                     .build(),
             )
@@ -1574,10 +1569,12 @@ abstract class NTKBase(
             "보안 확인 수행 중" in html
     }
 
+    private fun originOf(url: String): String = url.toHttpUrl().run { "$scheme://$host${if (port == 443) "" else ":$port"}" }
+
     private fun webViewCookieHeader(url: String, vararg extraCookies: String): String? {
         val cookieManager = android.webkit.CookieManager.getInstance()
         val cookiePairs = listOfNotNull(
-            cookieManager.getCookie(rootUrl),
+            cookieManager.getCookie(originOf(url)),
             cookieManager.getCookie(url),
         ) + extraCookies
         val cookieMap = linkedMapOf<String, String>()
@@ -1596,19 +1593,19 @@ abstract class NTKBase(
             .takeIf { it.isNotBlank() }
     }
 
-    private fun fingerprintCookie(): String {
+    private fun fingerprintCookie(referer: String): String {
+        val origin = originOf(referer)
         val cookieManager = android.webkit.CookieManager.getInstance()
-        val existing = cookieManager.getCookie(rootUrl)
+        val existing = cookieManager.getCookie(origin)
             ?.split(';')
             ?.map(String::trim)
             ?.firstOrNull { it.startsWith("ntk_fp=") }
             ?.substringAfter('=')
             ?.takeIf(FINGERPRINT_REGEX::matches)
-        val fingerprint = fingerprintValue.get() ?: existing ?: randomHex(FINGERPRINT_BYTES)
-        fingerprintValue.compareAndSet(null, fingerprint)
-        val cookie = "ntk_fp=${fingerprintValue.get() ?: fingerprint}"
+        val fingerprint = existing ?: randomHex(FINGERPRINT_BYTES)
+        val cookie = "ntk_fp=$fingerprint"
         cookieManager.setCookie(
-            rootUrl,
+            origin,
             "$cookie; Path=/; Max-Age=$FINGERPRINT_MAX_AGE_SECONDS; SameSite=Lax; Secure",
         )
         cookieManager.flush()
@@ -1678,29 +1675,19 @@ abstract class NTKBase(
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
-            key = PREF_DOMAIN_KEY
-            title = "도메인 번호 (sbxh#.com)"
-            summary = "현재 도메인 번호: ${preferences.getString(PREF_DOMAIN_KEY, PREF_DOMAIN_DEFAULT)}\n숫자만 입력하세요 (예: 1, 2, 300)"
-            setDefaultValue(PREF_DOMAIN_DEFAULT)
+            key = NTKDomain.MANUAL_KEY
+            title = "수동 접속 주소 (전체 HTTPS URL)"
+            summary = domain.summary()
+            setDefaultValue("")
             setOnPreferenceChangeListener { preference, newValue ->
-                val domainNumber = normalizeDomainNumber(newValue as? String)
-                    ?: return@setOnPreferenceChangeListener false
-                preferences.edit()
-                    .putString(PREF_DOMAIN_KEY, domainNumber)
-                    .putString(PREF_DOMAIN_DEFAULT_KEY, PREF_DOMAIN_DEFAULT)
-                    .apply()
-                preference.summary = "현재 도메인 번호: $domainNumber\n숫자만 입력하세요 (예: 1, 2, 300)"
+                val value = newValue as? String ?: return@setOnPreferenceChangeListener false
+                if (!domain.setManual(value)) return@setOnPreferenceChangeListener false
+                text = domain.manualUrl().orEmpty()
+                preference.summary = domain.summary()
                 false
             }
         }.also(screen::addPreference)
     }
-
-    private fun normalizeDomainNumber(value: String?): String? = value
-        ?.trim()
-        ?.takeIf(DOMAIN_NUMBER_REGEX::matches)
-        ?.trimStart('0')
-        ?.ifEmpty { "0" }
-        ?.takeUnless { it == "0" }
 
     companion object {
         private val json = Json { ignoreUnknownKeys = true }
@@ -1725,17 +1712,11 @@ abstract class NTKBase(
         private val ASN1_SEQUENCE = 0x30.toByte()
         private val ASN1_INTEGER = 0x02.toByte()
         private val CLIENT_KEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
-        private val DOMAIN_NUMBER_REGEX = Regex("^\\d+$")
         private val FINGERPRINT_REGEX = Regex("^[a-fA-F0-9]{16,}$")
         private const val HEX_DIGITS = "0123456789abcdef"
         private const val FINGERPRINT_BYTES = 16
         private const val FINGERPRINT_MAX_AGE_SECONDS = 31_536_000
-        private const val AD_ACK_MAX_AGE_SECONDS = 300
         private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        private const val PREF_DOMAIN_KEY = "pref_domain_key"
-        private const val PREF_DOMAIN_DEFAULT_KEY = "pref_domain_default_key"
-        private const val PREVIOUS_DOMAIN_DEFAULT = "3"
-        private const val PREF_DOMAIN_DEFAULT = "9"
         private const val EPISODES_PER_PAGE = 100
         private const val MAX_EPISODE_API_PAGES = 1_000
         const val PAGE_SIZE = 49

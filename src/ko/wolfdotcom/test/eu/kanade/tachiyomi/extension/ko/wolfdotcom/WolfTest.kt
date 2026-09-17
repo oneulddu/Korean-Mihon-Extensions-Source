@@ -40,4 +40,28 @@ class WolfTest {
             ),
         )
     }
+
+    @Test
+    fun guideValidatesWholeUrlsBeforeUpgradingHttp() {
+        listOf(
+            "https://user@wfwf501.com",
+            "https://wfwf501.com@evil.example",
+            "https://wfwf501.com:8443",
+            "https://wfwf501.com/path",
+            "https://wfwf501.com/?next=bad",
+            "https://wfwf501.com/#bad",
+            "https://wfwf501.com.evil.example",
+            "http://wfwf501.com:8080",
+        ).forEach {
+            assertEquals(it, null, parseWolfLatestBaseUrl("<a href='$it'>$it</a>", "https://guide.example/"))
+        }
+        assertEquals("https://wfwf501.com", parseWolfLatestBaseUrl("<a href='http://wfwf501.com/'>이동</a>", "https://guide.example/"))
+    }
+
+    @Test
+    fun onlyExplicitMigrationButtonChangesContentOrigin() {
+        assertEquals("https://wfwf501.com", parseWolfMigrationPage("<a class='main-btn' href='https://wfwf501.com/'>이동</a>", "https://wfwf494.com"))
+        assertEquals(null, parseWolfMigrationPage("<a href='https://wfwf501.com/'>광고</a>", "https://wfwf494.com"))
+        assertEquals(null, parseWolfMigrationPage("<a class='main-btn' href='https://wfwf501.com:8443/'>이동</a>", "https://wfwf494.com"))
+    }
 }

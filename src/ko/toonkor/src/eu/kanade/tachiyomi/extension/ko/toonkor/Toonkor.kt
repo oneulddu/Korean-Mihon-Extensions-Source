@@ -128,12 +128,13 @@ class Toonkor :
         val status = filterList.firstInstanceOrNull<StatusFilter>()
         val sort = filterList.firstInstanceOrNull<SortFilter>()
 
-        val requestPath = when {
-            query.isNotBlank() -> "/bbs/search.php?sfl=wr_subject%7C%7Cwr_content&stx=$query"
-            else -> "${type?.toUriPart() ?: ""}${status?.toUriPart() ?: ""}${sort?.toUriPart() ?: ""}"
+        val url = if (query.isNotBlank()) {
+            toonkorSearchUrl(baseUrl, query)
+        } else {
+            (baseUrl + "${type?.toUriPart() ?: ""}${status?.toUriPart() ?: ""}${sort?.toUriPart() ?: ""}").toHttpUrl()
         }
 
-        return GET(baseUrl + requestPath, headers)
+        return GET(url, headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
@@ -331,3 +332,8 @@ class Toonkor :
         private const val BASE_URL_PREF_TITLE = "Override BaseUrl"
     }
 }
+
+internal fun toonkorSearchUrl(baseUrl: String, query: String) = "$baseUrl/bbs/search.php".toHttpUrl().newBuilder()
+    .addQueryParameter("sfl", "wr_subject||wr_content")
+    .addQueryParameter("stx", query)
+    .build()

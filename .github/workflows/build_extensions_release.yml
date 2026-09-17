@@ -44,22 +44,28 @@ jobs:
       - name: Resolve extension build tasks
         id: tasks
         run: |
+          NEEDS_PRUNE=false
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             SELECTED_EXTENSIONS=$(python3 scripts/list_extensions.py --names --extensions "$EXTENSIONS")
             TASKS=$(python3 scripts/list_extensions.py --gradle-tasks --extensions "$EXTENSIONS")
           else
             SELECTED_EXTENSIONS=$(python3 scripts/list_extensions.py --names --changed-from "${{ github.event.before }}" --changed-to "${{ github.sha }}")
             TASKS=$(python3 scripts/list_extensions.py --gradle-tasks --changed-from "${{ github.event.before }}" --changed-to "${{ github.sha }}")
+            NEEDS_PRUNE=$(python3 scripts/list_extensions.py --needs-prune --changed-from "${{ github.event.before }}" --changed-to "${{ github.sha }}")
           fi
 
           if [ -z "$TASKS" ]; then
             echo "No changed extensions to build"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "should_publish=$NEEDS_PRUNE" >> "$GITHUB_OUTPUT"
+            echo "prune_only=$NEEDS_PRUNE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "selected_extensions=$SELECTED_EXTENSIONS" >> "$GITHUB_OUTPUT"
           echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          echo "prune_only=false" >> "$GITHUB_OUTPUT"
           echo "tasks=$TASKS" >> "$GITHUB_OUTPUT"
           echo "Selected extensions: $SELECTED_EXTENSIONS"
           echo "Resolved tasks: $TASKS"
@@ -100,11 +106,12 @@ jobs:
           # Spotless format tasks share temporary cleanup state inside each module and can
           # race when several formats run in parallel. Check formatting once serially,
           # then keep the expensive Android compilation parallel without rerunning it.
+          node --test src/ko/ntk/test/image-bridge.test.mjs
           ./gradlew --no-daemon --no-parallel spotlessCheck
-          ./gradlew --no-daemon ${{ steps.tasks.outputs.tasks }} -x spotlessCheck
+          ./gradlew --no-daemon testDebugUnitTest ${{ steps.tasks.outputs.tasks }} -x spotlessCheck
 
       - name: Checkout deployment repository
-        if: steps.tasks.outputs.should_build == 'true'
+        if: steps.tasks.outputs.should_publish == 'true'
         uses: actions/checkout@v7
         with:
           repository: oneulddu/Korean-Mihon-Extensions
@@ -113,15 +120,19 @@ jobs:
           token: ${{ secrets.DEPLOY_TOKEN }}
 
       - name: Update deployment repository files
-        if: steps.tasks.outputs.should_build == 'true'
+        if: steps.tasks.outputs.should_publish == 'true'
         run: |
-          python3 scripts/update_repo.py \
-            --source-dir "$GITHUB_WORKSPACE" \
-            --deploy-dir "$GITHUB_WORKSPACE/deploy" \
-            --extensions "${{ steps.tasks.outputs.selected_extensions }}"
+          if [ "${{ steps.tasks.outputs.prune_only }}" = "true" ]; then
+            python3 scripts/update_repo.py --source-dir "$GITHUB_WORKSPACE" --deploy-dir "$GITHUB_WORKSPACE/deploy" --prune-only
+          else
+            python3 scripts/update_repo.py \
+              --source-dir "$GITHUB_WORKSPACE" \
+              --deploy-dir "$GITHUB_WORKSPACE/deploy" \
+              --extensions "${{ steps.tasks.outputs.selected_extensions }}"
+          fi
 
       - name: Commit and push deployment repository
-        if: steps.tasks.outputs.should_build == 'true'
+        if: steps.tasks.outputs.should_publish == 'true'
         run: |
           cd deploy
           git config user.name "github-actions[bot]"
@@ -156,10 +167,8 @@ jobs:
           git push origin repo
 
       - name: Sync source README extension table
-        # 빌드/배포가 성공한 뒤에만 실행한다. push 이벤트에서 실제로 빌드가 돌아
-        # 배포가 갱신된 경우에만 소스 README의 배포 상태 표를 게시한다.
-        # (빌드 실패 시 이 스텝은 건너뛰므로 README가 미배포 확장을 배포됨으로 표기하지 않는다.)
-        if: github.event_name == 'push' && steps.tasks.outputs.should_build == 'true'
+        # APK 배포 또는 삭제-only 인덱스 동기화가 성공한 뒤에만 표를 갱신한다.
+        if: github.event_name == 'push' && steps.tasks.outputs.should_publish == 'true'
         # 문서 동기화 실패가 이미 끝난 릴리스를 실패로 만들지 않도록 격리한다.
         continue-on-error: true
         run: |

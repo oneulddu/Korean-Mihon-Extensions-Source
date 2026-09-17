@@ -43,7 +43,7 @@ internal val genreList = listOf(
     SelectFilterOption("시대", "시대"),
     SelectFilterOption("액션", "액션"),
     SelectFilterOption("순정", "순정"),
-    SelectFilterOption("일상+치유", "일상%2B치유"),
+    SelectFilterOption("일상+치유", "일상+치유"),
     SelectFilterOption("추리", "추리"),
     SelectFilterOption("판타지", "판타지"),
     SelectFilterOption("학원", "학원"),

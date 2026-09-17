@@ -5,6 +5,11 @@
         { "name": "블랙툰", "lang": "ko", "baseUrl": "https://blacktoon417.com" }
       ]
     },
+    "goodtoon": {
+      "sources": [
+        { "name": "굿툰", "lang": "ko", "baseUrl": "https://www.goodtoon004.com" }
+      ]
+    },
     "navercomic": {
       "sources": [
         { "name": "Naver Webtoon", "lang": "ko", "baseUrl": "https://comic.naver.com" },

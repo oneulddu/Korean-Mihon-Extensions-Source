@@ -186,6 +186,91 @@ class UpdateRepoTest(unittest.TestCase):
             self.assertFalse((deploy_dir / "apk" / stale_apk).exists())
             self.assertFalse((deploy_dir / "icon" / f"{stale_package}.png").exists())
 
+    def test_selects_numeric_latest_apk_and_removes_old_deployed_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = Path(temp_dir) / "source"
+            deploy_dir = Path(temp_dir) / "deploy"
+            deploy_dir.mkdir()
+            self._prepare_source(source_dir)
+            module = source_dir / "src/ko/sample"
+            build = module / "build.gradle"
+            build.write_text(build.read_text().replace("extVersionCode = 1", "extVersionCode = 10"))
+            apk_dir = module / "build/outputs/apk/release"
+            (apk_dir / "tachiyomi-ko.sample-v1.0.9-release.apk").write_bytes(b"old")
+            (apk_dir / "tachiyomi-ko.sample-v1.0.10-release.apk").write_bytes(b"new")
+            self._run_update(source_dir, deploy_dir)
+            entry = json.loads((deploy_dir / "index.min.json").read_text())[0]
+            self.assertEqual(10, entry["code"])
+            self.assertEqual(b"new", (deploy_dir / "apk" / entry["apk"]).read_bytes())
+            self.assertEqual(1, len(list((deploy_dir / "apk").glob("*.apk"))))
+
+    def test_stale_apk_fails_before_changing_deployment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = Path(temp_dir) / "source"
+            deploy_dir = Path(temp_dir) / "deploy"
+            deploy_dir.mkdir()
+            self._prepare_source(source_dir)
+            self._run_update(source_dir, deploy_dir)
+            before = {p.relative_to(deploy_dir): p.read_bytes() for p in deploy_dir.rglob("*") if p.is_file()}
+            build = source_dir / "src/ko/sample/build.gradle"
+            build.write_text(build.read_text().replace("extVersionCode = 1", "extVersionCode = 2"))
+            result = subprocess.run([
+                sys.executable, str(ROOT_DIR / "scripts/update_repo.py"),
+                "--source-dir", str(source_dir), "--deploy-dir", str(deploy_dir),
+                "--extensions", "sample",
+            ], capture_output=True, text=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("does not match current source", result.stderr)
+            self.assertEqual(before, {p.relative_to(deploy_dir): p.read_bytes() for p in deploy_dir.rglob("*") if p.is_file()})
+
+    def test_missing_requested_apk_fails_without_publishing_other_modules(self) -> None:
+        import shutil
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = Path(temp_dir) / "source"
+            deploy_dir = Path(temp_dir) / "deploy"
+            self._prepare_source(source_dir)
+            missing = source_dir / "src/ko/missing"
+            missing.mkdir()
+            shutil.copyfile(source_dir / "src/ko/sample/build.gradle", missing / "build.gradle")
+            result = subprocess.run([
+                sys.executable, str(ROOT_DIR / "scripts/update_repo.py"),
+                "--source-dir", str(source_dir), "--deploy-dir", str(deploy_dir),
+                "--extensions", "sample missing",
+            ], capture_output=True, text=True)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("Missing release APK(s): missing", result.stderr)
+            self.assertFalse(deploy_dir.exists())
+
+    def test_prune_only_works_without_any_built_apks(self) -> None:
+        import shutil
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_dir = Path(temp_dir) / "source"
+            deploy_dir = Path(temp_dir) / "deploy"
+            deploy_dir.mkdir()
+            self._prepare_source(source_dir)
+            self._run_update(source_dir, deploy_dir)
+            shutil.rmtree(source_dir / "src/ko/sample")
+            subprocess.run([
+                sys.executable, str(ROOT_DIR / "scripts/update_repo.py"),
+                "--source-dir", str(source_dir), "--deploy-dir", str(deploy_dir), "--prune-only",
+            ], check=True)
+            self.assertEqual([], json.loads((deploy_dir / "index.min.json").read_text()))
+            self.assertEqual([], json.loads((deploy_dir / "index.json").read_text())["extensions"])
+            self.assertEqual([], list((deploy_dir / "apk").iterdir()))
+
+    def test_multisource_version_includes_base_and_override(self) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("review_update_repo", ROOT_DIR / "scripts/update_repo.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            theme = root / "lib-multisrc/madara"
+            theme.mkdir(parents=True)
+            (theme / "build.gradle.kts").write_text("baseVersionCode = 51")
+            self.assertEqual(54, module.expected_version_code(root, "themePkg = 'madara'\noverrideVersionCode = 3"))
+
 
 if __name__ == "__main__":
     unittest.main()

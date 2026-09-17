@@ -6,6 +6,13 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
 
 class DynamicBaseUrlTest {
     private val keys = BaseUrlCacheKeys("cached", "fetched", "attempted")
@@ -91,7 +98,7 @@ class DynamicBaseUrlTest {
 
         assertEquals("https://site9.com/chapter/1", rewritten.url.toString())
         assertEquals("https://site9.com/title/1", rewritten.header("Referer"))
-        assertEquals("https://site9.com/", rewritten.header("Origin"))
+        assertEquals("https://site9.com", rewritten.header("Origin"))
 
         val cdnRequest = Request.Builder().url("https://cdn.example.com/image.jpg").build()
         assertTrue(cdnRequest === cdnRequest.rewriteBaseUrl("https://site9.com") { it.matches(Regex("site\\d+\\.com")) })
@@ -106,6 +113,167 @@ class DynamicBaseUrlTest {
         assertEquals(false, shouldInvalidateNumberedDomainCache("https://site427.com", "425", 426, hostRegex))
         assertEquals(false, shouldInvalidateNumberedDomainCache(null, "427", 426, hostRegex))
         assertTrue(shouldInvalidateNumberedDomainCache(null, null, 426, hostRegex))
+    }
+
+    @Test
+    fun concurrentRequestsWaitForTheSameFreshAddress() {
+        val store = FakeStorage(strings = ConcurrentHashMap(mapOf("cached" to "https://site2.com")), longs = ConcurrentHashMap())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val calls = AtomicInteger()
+        val resolver = resolver(store, now = { 100_000_000L }, discover = {
+            calls.incrementAndGet()
+            entered.countDown()
+            check(release.await(5, TimeUnit.SECONDS))
+            "https://site3.com"
+        })
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val first = executor.submit<String> { resolver.resolve() }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            val second = executor.submit<String> { resolver.resolve() }
+            try {
+                second.get(100, TimeUnit.MILLISECONDS)
+                throw AssertionError("Concurrent request returned before discovery completed")
+            } catch (_: TimeoutException) {
+                // Both requests must use the discovery result instead of the stale address.
+            }
+            release.countDown()
+            assertEquals("https://site3.com", first.get(5, TimeUnit.SECONDS))
+            assertEquals("https://site3.com", second.get(5, TimeUnit.SECONDS))
+            assertEquals(1, calls.get())
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun invalidationDoesNotWaitForNetworkOrRestoreItsOldResult() {
+        val store = FakeStorage(strings = ConcurrentHashMap(), longs = ConcurrentHashMap())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val calls = AtomicInteger()
+        val resolver = resolver(store, now = { 100_000_000L }, discover = {
+            if (calls.incrementAndGet() == 1) {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+                "https://site2.com"
+            } else {
+                "https://site3.com"
+            }
+        })
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val first = executor.submit<String> { resolver.resolve() }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            executor.submit { resolver.clearCache() }.get(1, TimeUnit.SECONDS)
+            assertNull(store.getString("cached"))
+            release.countDown()
+            assertEquals("https://site3.com", first.get(5, TimeUnit.SECONDS))
+            assertEquals("https://site3.com", store.getString("cached"))
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun ioFailureStillUsesRedirectAndPreservesLastGoodCache() {
+        val store = FakeStorage(strings = mutableMapOf("cached" to "https://site2.com"))
+        val resolver = resolver(store, now = { 100_000_000L }, discover = { throw IOException("offline") }, redirect = { "https://site4.com" })
+        assertEquals("https://site4.com", resolver.resolve())
+        resolver.clearCache()
+        store.putString("cached", "https://site4.com")
+        val offline = resolver(store, now = { 200_000_000L }, discover = { throw IOException("offline") }, redirect = { throw IOException("offline") })
+        assertEquals("https://site4.com", offline.resolve())
+    }
+
+    @Test
+    fun clockRollbackDoesNotExtendExpiredCache() {
+        val store = FakeStorage(
+            strings = mutableMapOf("cached" to "https://site2.com"),
+            longs = mutableMapOf("fetched" to 200_000_000L, "attempted" to 200_000_000L),
+        )
+        assertEquals("https://site3.com", resolver(store, now = { 100_000_000L }, discover = { "https://site3.com" }).resolve())
+    }
+
+    @Test
+    fun successfulRequestRedirectUpdatesCacheButLateOrExternalResponsesCannotRevertIt() {
+        val store = FakeStorage(strings = mutableMapOf("cached" to "https://site2.com"))
+        val resolver = resolver(store, now = { 100_000_000L }, discover = { null })
+        assertTrue(resolver.recordRedirect("https://site2.com", "https://site3.com"))
+        assertEquals("https://site3.com", resolver.resolve())
+        assertEquals(false, resolver.recordRedirect("https://site2.com", "https://site1.com"))
+        assertEquals(false, resolver.recordRedirect("https://site3.com", "https://cdn.example.com"))
+        assertEquals("https://site3.com", resolver.resolve())
+    }
+
+    @Test
+    fun failedFreshAddressRefreshesOnceAndPreservesLastGoodUrl() {
+        val store = FakeStorage(strings = mutableMapOf("cached" to "https://site2.com"), longs = mutableMapOf("fetched" to 999_000L))
+        var calls = 0
+        var result: String? = null
+        val resolver = resolver(store, now = { 1_000_000L }, discover = {
+            calls++
+            result
+        })
+        assertEquals("https://site2.com", resolver.resolveAfterFailure("https://site2.com"))
+        assertEquals("https://site2.com", resolver.resolveAfterFailure("https://site2.com"))
+        assertEquals(1, calls)
+        assertEquals("https://site2.com", store.strings["cached"])
+        resolver.clearCache()
+        result = "https://site3.com"
+        assertEquals("https://site3.com", resolver.resolveAfterFailure("https://site1.com"))
+        assertEquals(2, calls)
+        // A late failure cannot expire the new address.
+        assertEquals("https://site3.com", resolver.resolveAfterFailure("https://site2.com"))
+        assertEquals(2, calls)
+    }
+
+    @Test
+    fun rediscoveringSameDeadOriginDoesNotCreateARefreshStorm() {
+        val store = FakeStorage(strings = mutableMapOf("cached" to "https://site2.com"), longs = mutableMapOf("fetched" to 999_000L))
+        var calls = 0
+        val resolver = resolver(store, now = { 1_000_000L }, discover = {
+            calls++
+            "https://site2.com"
+        })
+        repeat(20) { assertEquals("https://site2.com", resolver.resolveAfterFailure("https://site2.com")) }
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun failureInvalidatesOlderLookupAndConcurrentCallersShareRecovery() {
+        val store = FakeStorage(strings = ConcurrentHashMap(mapOf("cached" to "https://site2.com")), longs = ConcurrentHashMap())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val calls = AtomicInteger()
+        val resolver = resolver(store, now = { 100_000_000L }, discover = {
+            if (calls.incrementAndGet() == 1) {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+                "https://site2.com"
+            } else {
+                "https://site3.com"
+            }
+        })
+        val executor = Executors.newFixedThreadPool(3)
+        try {
+            val normal = executor.submit<String> { resolver.resolve() }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            val recovery = executor.submit<String> { resolver.resolveAfterFailure("https://site2.com") }
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (store.getLong(keys.recoveryAttemptedAt) == 0L && System.nanoTime() < deadline) Thread.yield()
+            assertTrue(store.getLong(keys.recoveryAttemptedAt) > 0L)
+            val concurrent = executor.submit<String> { resolver.resolveAfterFailure("https://site2.com") }
+            release.countDown()
+            listOf(normal, recovery, concurrent).forEach { assertEquals("https://site3.com", it.get(5, TimeUnit.SECONDS)) }
+            assertEquals(2, calls.get())
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
     }
 
     private fun resolver(

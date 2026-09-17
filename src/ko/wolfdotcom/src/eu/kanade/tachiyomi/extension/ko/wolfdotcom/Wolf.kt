@@ -13,11 +13,14 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.AutomaticDomainInterceptor
 import keiyoushi.utils.BaseUrlCacheKeys
 import keiyoushi.utils.DynamicBaseUrlResolver
 import keiyoushi.utils.SharedPreferencesBaseUrlStorage
+import keiyoushi.utils.findDiscoveredBaseUrl
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.normalizeBaseUrl
+import keiyoushi.utils.normalizeDiscoveredBaseUrl
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.rewriteBaseUrl
 import keiyoushi.utils.shouldInvalidateNumberedDomainCache
@@ -54,25 +57,38 @@ open class Wolf(
     override val supportsLatest = true
 
     override val client = network.client.newBuilder()
-        .addInterceptor(::domainNumberInterceptor)
+        .addInterceptor(
+            AutomaticDomainInterceptor(
+                resolver = { latestBaseUrlResolver },
+                manualBaseUrl = ::getManualBaseUrl,
+                isAutomaticHost = { it.matches(domainHostRegex) },
+                rewrite = ::rewriteDomainRequest,
+                migrationTarget = { parseWolfMigrationPage(it.peekBody(128 * 1024).string(), it.request.url.toString()) },
+                onRedirect = { saveAutomaticBaseUrlSource(SOURCE_NUMBERED_PROBE) },
+            ),
+        )
         .addNetworkInterceptor(::refererInterceptor)
         .build()
 
     private val preference: SharedPreferences by getPreferencesLazy()
 
-    private val domainLookupClient = network.client.newBuilder()
-        .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .build()
-
     private val noRedirectClient = network.client.newBuilder()
         .followRedirects(false)
+        .followSslRedirects(false)
+        .callTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .connectTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .readTimeout(DOMAIN_LOOKUP_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
 
     private val latestBaseUrlResolver by lazy {
         migrateLegacyDomainCache()
+        if (!preference.getBoolean("official_guide_discovery_v2", false)) {
+            preference.edit()
+                .remove(PREF_LATEST_DOMAIN_FETCHED_AT)
+                .remove(PREF_LATEST_DOMAIN_ATTEMPTED_AT)
+                .putBoolean("official_guide_discovery_v2", true)
+                .apply()
+        }
         DynamicBaseUrlResolver(
             storage = SharedPreferencesBaseUrlStorage(preference),
             keys = BaseUrlCacheKeys(
@@ -106,7 +122,7 @@ open class Wolf(
 
     override fun getFilterList(): FilterList = filters()
 
-    private lateinit var browseCache: List<List<BrowseItem>>
+    private val browseCache = WolfBrowseCache<BrowseItem>()
 
     class BrowseItem(
         val id: Int,
@@ -119,16 +135,25 @@ open class Wolf(
             return querySearch(query)
         }
 
-        return if (page == 1) {
-            client.newCall(searchMangaRequest(page, query, filters))
-                .asObservableSuccess()
-                .map {
-                    parseBrowsePage(it)
-                    paginatedBrowsePage(0)
+        // Capture the complete request before subscribing so filter edits cannot change its key.
+        val request = searchMangaRequest(page, query, filters)
+        val key = request.url.encodedPath + "?" + request.url.encodedQuery.orEmpty()
+        return cancellableWolfCall({ client.newCall(request) }) { call ->
+            val (items, hasNextPage) = browseCache.page(key, page) {
+                call.execute().use { response ->
+                    check(response.isSuccessful) { "browse request failed: ${response.code}" }
+                    parseBrowsePage(response)
                 }
-        } else {
-            Observable.just(
-                paginatedBrowsePage(page - 1),
+            }
+            MangasPage(
+                items.map {
+                    SManga.create().apply {
+                        url = it.id.toString()
+                        title = it.title
+                        thumbnail_url = it.cover
+                    }
+                },
+                hasNextPage,
             )
         }
     }
@@ -143,10 +168,10 @@ open class Wolf(
         return GET(url, headers)
     }
 
-    private fun parseBrowsePage(response: Response) {
+    private fun parseBrowsePage(response: Response): List<BrowseItem> {
         val document = response.asJsoup()
 
-        browseCache = document.select("a.t-card[href*=$entryPath]").mapNotNull {
+        return document.select("a.t-card[href*=$entryPath]").mapNotNull {
             val id = it.absUrl("href").toHttpUrl()
                 .queryParameter("toon")?.toIntOrNull()
                 ?: return@mapNotNull null
@@ -157,19 +182,8 @@ open class Wolf(
                     ?: return@mapNotNull null,
                 cover = it.selectFirst(".t-img img")?.absUrl("src"),
             )
-        }.chunked(20).ifEmpty { listOf(emptyList()) }
+        }
     }
-
-    private fun paginatedBrowsePage(index: Int): MangasPage = MangasPage(
-        browseCache[index].map {
-            SManga.create().apply {
-                url = it.id.toString()
-                title = it.title
-                thumbnail_url = it.cover
-            }
-        },
-        browseCache.lastIndex > index,
-    )
 
     private fun querySearch(query: String): Observable<MangasPage> {
         if (query.length < 2) {
@@ -291,7 +305,7 @@ open class Wolf(
             title = "Override BaseUrl"
             summary = baseUrlPreferenceSummary()
             setDefaultValue("")
-            dialogMessage = "비워두면 $LATEST_DOMAIN_ENDPOINT 에서 최신 주소를 자동 확인합니다."
+            dialogMessage = "비워두면 공식 안내 사이트와 공식 텔레그램 채널에서 최신 주소를 자동 확인합니다."
             setOnPreferenceChangeListener { preference, newValue ->
                 val value = (newValue as? String).orEmpty().trim()
                 if (value.isEmpty()) {
@@ -379,49 +393,43 @@ open class Wolf(
             field = value
         }
 
-    private fun domainNumberInterceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
+    private fun rewriteDomainRequest(request: Request): Request {
         val manualBaseUrl = getManualBaseUrl()?.toHttpUrl()
         val isAutomaticHost = request.url.host.matches(domainHostRegex)
         val isManualHost = manualBaseUrl != null && request.url.host == manualBaseUrl.host
-        if (!isAutomaticHost && !isManualHost) return chain.proceed(request)
+        if (!isAutomaticHost && !isManualHost) return request
 
         val resolvedBaseUrl = manualBaseUrl?.toString() ?: latestBaseUrlResolver.resolve()
-        val rewrittenRequest = request.rewriteBaseUrl(resolvedBaseUrl) { host ->
+        return request.rewriteBaseUrl(getManualBaseUrl() ?: resolvedBaseUrl) { host ->
             host.matches(domainHostRegex) || host == manualBaseUrl?.host
         }
-
-        return chain.proceed(rewrittenRequest)
     }
 
-    private fun fetchLatestBaseUrl(): String? = runCatching {
-        domainLookupClient.newCall(
-            GET(
-                LATEST_DOMAIN_ENDPOINT,
-                headersBuilder()
-                    .set("Accept", "text/html,application/xhtml+xml")
-                    .set("Cache-Control", "no-cache")
-                    .build(),
-            ),
-        ).execute().use { response ->
-            if (!response.isSuccessful) return@use null
+    private val domainDiscovery by lazy { WolfDomainDiscovery(noRedirectClient) }
 
-            parseWolfLatestBaseUrl(response.body.string(), response.request.url.toString())
-                ?.also { saveAutomaticBaseUrlSource(SOURCE_OFFICIAL_PORTAL) }
-        }
-    }.getOrNull()
+    private fun fetchLatestBaseUrl(): String? = domainDiscovery.discover()?.let {
+        saveAutomaticBaseUrlSource(it.source)
+        it.baseUrl
+    }
 
     private fun resolveRedirectBaseUrl(): String? = runCatching {
-        noRedirectClient.newCall(GET("https://${domainHost(domainNumber)}", headers)).execute().use { response ->
-            val resolvedBaseUrl = response.header("Location")
-                ?.let(response.request.url::resolve)
-                ?.takeIf(::isValidDiscoveredDomain)
-                ?.toString()
-                ?.trimEnd('/')
-                ?: response.request.url
-                    .takeIf { response.isSuccessful && isValidDiscoveredDomain(it) }
+        val current = latestBaseUrlResolver.cachedBaseUrl() ?: "https://${domainHost(domainNumber)}"
+        noRedirectClient.newCall(GET(current, headers)).execute().use { response ->
+            val resolvedBaseUrl = if (response.code in 300..399) {
+                response.header("Location")
+                    ?.let(response.request.url::resolve)
+                    ?.takeIf(::isValidDiscoveredDomain)
                     ?.toString()
                     ?.trimEnd('/')
+            } else if (response.isSuccessful) {
+                val body = response.body.string()
+                parseWolfMigrationPage(body, current) ?: current.takeIf {
+                    // A 200 migration/parking/error page is not a healthy catalogue.
+                    Jsoup.parse(body).selectFirst("a.t-card, .w-title") != null
+                }
+            } else {
+                null
+            }
 
             resolvedBaseUrl?.also { saveAutomaticBaseUrlSource(SOURCE_NUMBERED_PROBE) }
         }
@@ -432,6 +440,7 @@ open class Wolf(
         url.port == 443 &&
         url.encodedPath == "/" &&
         url.query == null &&
+        url.fragment == null &&
         url.username.isEmpty() &&
         url.password.isEmpty()
 
@@ -472,28 +481,27 @@ private const val PREF_LATEST_DOMAIN_URL = "latest_domain_url"
 private const val PREF_LATEST_DOMAIN_FETCHED_AT = "latest_domain_fetched_at"
 private const val PREF_LATEST_DOMAIN_ATTEMPTED_AT = "latest_domain_attempted_at"
 private const val PREF_LATEST_DOMAIN_SOURCE = "latest_domain_source"
-private const val LATEST_DOMAIN_ENDPOINT = "https://a14c.com/"
 private const val DOMAIN_LOOKUP_TIMEOUT_SECONDS = 8L
-private const val SOURCE_OFFICIAL_PORTAL = "공식 안내 사이트"
 private const val SOURCE_NUMBERED_PROBE = "번호형 주소 확인"
 private const val SOURCE_LEGACY_CACHE = "기존 자동 캐시"
 private const val SOURCE_BUILD_DEFAULT = "빌드 기본 주소"
 
 private val wolfDomainHostRegex = Regex("""^wfwf\d+\.com$""")
 private val wolfDomainNumberRegex = Regex("""^wfwf(\d+)\.com$""")
-private val latestWolfDomainRegex =
-    Regex("""(?i)(?<![a-z0-9.-])(?:https?://)?wfwf\d+\.com(?![a-z0-9.-])""")
 
 internal fun parseWolfLatestBaseUrl(html: String, portalUrl: String): String? {
     val document = Jsoup.parse(html, portalUrl)
     val candidates = sequence {
-        yieldAll(document.select("a[href]").asSequence().map { it.absUrl("href") })
+        yieldAll(document.select("a[href]").asSequence().map { it.attr("href") })
         yield(document.outerHtml())
     }
 
     return candidates
-        .flatMap { latestWolfDomainRegex.findAll(it).map(MatchResult::value) }
-        .map { if (it.startsWith("http", ignoreCase = true)) it else "https://$it" }
-        .mapNotNull { normalizeBaseUrl(it) { url -> url.host.matches(wolfDomainHostRegex) } }
+        .mapNotNull { findDiscoveredBaseUrl(it) { host -> host.matches(wolfDomainHostRegex) } }
         .firstOrNull()
 }
+
+internal fun parseWolfMigrationPage(html: String, current: String): String? = Jsoup.parse(html, current)
+    .select("a.main-btn[href]").firstNotNullOfOrNull {
+        normalizeDiscoveredBaseUrl(it.attr("href")) { host -> host.matches(wolfDomainHostRegex) }
+    }

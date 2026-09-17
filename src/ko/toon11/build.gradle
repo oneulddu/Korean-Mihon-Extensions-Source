@@ -1,8 +1,26 @@
 ext {
     extName = '11toon'
     extClass = '.Toon11'
-    extVersionCode = 4
+    extVersionCode = 5
     isNsfw = true
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+
+    sourceSets {
+        test {
+            java.srcDirs = ['test']
+            kotlin.srcDirs = ['test']
+        }
+    }
+}
+
+dependencies {
+    testImplementation libs.bundles.common
+    testImplementation libs.junit
+}
