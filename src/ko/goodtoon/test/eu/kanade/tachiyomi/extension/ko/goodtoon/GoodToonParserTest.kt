@@ -143,4 +143,18 @@ class GoodToonParserTest {
         assertEquals("https://goodtoon004.com/manga/gt-60423/", request.header("Referer"))
         assertEquals("https://goodtoon004.com", request.header("Origin"))
     }
+
+    @Test fun cdnCoverHeadersFollowRotationWithoutChangingImageUrl() {
+        val cover = Request.Builder().url("https://img.goodtoon9001.top/gt-60423/cover.jpg")
+            .header("Referer", "https://www.goodtoon003.com/").build()
+        val fixed = cover.rewriteGoodToonImageHeaders("https://goodtoon004.com")
+        assertEquals(cover.url, fixed.url)
+        assertEquals("https://goodtoon004.com/", fixed.header("Referer"))
+        assertEquals("https://goodtoon004.com", fixed.header("Origin"))
+        val reader = cover.newBuilder().header("Referer", "https://goodtoon003.com/manga/gt-60423/29/").build()
+            .rewriteGoodToonImageHeaders("https://manual.example")
+        assertEquals("https://manual.example/manga/gt-60423/29/", reader.header("Referer"))
+        val external = Request.Builder().url("https://external.example/image.jpg").build()
+        assertSame(external, external.rewriteGoodToonImageHeaders("https://goodtoon004.com"))
+    }
 }

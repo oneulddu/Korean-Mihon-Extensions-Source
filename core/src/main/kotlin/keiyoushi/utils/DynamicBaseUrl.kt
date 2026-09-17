@@ -42,6 +42,7 @@ data class BaseUrlCacheKeys(
     val cachedUrl: String,
     val fetchedAt: String,
     val attemptedAt: String,
+    val recoveryAttemptedAt: String = "${attemptedAt}_recovery",
 )
 
 class DynamicBaseUrlResolver(
@@ -110,6 +111,7 @@ class DynamicBaseUrlResolver(
             val completedAt = now()
             storage.putLong(keys.attemptedAt, completedAt)
             if (discovered != null) {
+                if (discovered != previousUrl) storage.remove(keys.recoveryAttemptedAt)
                 storage.putString(keys.cachedUrl, discovered)
                 storage.putLong(keys.fetchedAt, completedAt)
             }
@@ -128,10 +130,27 @@ class DynamicBaseUrlResolver(
 
     fun cachedBaseUrl(): String? = storage.getString(keys.cachedUrl)?.let(::normalizeAutomaticBaseUrl)
 
+    /** A dead, still-fresh origin may be checked once per retry window without losing it. */
+    fun resolveAfterFailure(failedBaseUrl: String): String {
+        val failed = normalizeAutomaticBaseUrl(failedBaseUrl) ?: return cachedBaseUrl() ?: normalizedFallback()
+        synchronized(refreshLock) {
+            val current = cachedBaseUrl() ?: normalizedFallback()
+            if (current != failed) return current
+            if (!isRecent(storage.getLong(keys.recoveryAttemptedAt), now(), retryDelayMs)) {
+                // An older in-flight lookup must not restore the failed origin's freshness.
+                // resolve() waits for that generation, then shares one new lookup with all waiters.
+                generation++
+                storage.putLong(keys.recoveryAttemptedAt, now())
+                storage.remove(keys.fetchedAt, keys.attemptedAt)
+            }
+        }
+        return resolve()
+    }
+
     fun clearCache() {
         synchronized(refreshLock) {
             generation++
-            storage.remove(keys.cachedUrl, keys.fetchedAt, keys.attemptedAt)
+            storage.remove(keys.cachedUrl, keys.fetchedAt, keys.attemptedAt, keys.recoveryAttemptedAt)
         }
     }
 
@@ -145,6 +164,7 @@ class DynamicBaseUrlResolver(
             storage.putString(keys.cachedUrl, target)
             storage.putLong(keys.fetchedAt, now())
             storage.putLong(keys.attemptedAt, now())
+            storage.remove(keys.recoveryAttemptedAt)
             onAutomaticUrlResolved(target)
             true
         }

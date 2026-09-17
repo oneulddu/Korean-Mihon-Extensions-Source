@@ -209,6 +209,73 @@ class DynamicBaseUrlTest {
         assertEquals("https://site3.com", resolver.resolve())
     }
 
+    @Test
+    fun failedFreshAddressRefreshesOnceAndPreservesLastGoodUrl() {
+        val store = FakeStorage(strings = mutableMapOf("cached" to "https://site2.com"), longs = mutableMapOf("fetched" to 999_000L))
+        var calls = 0
+        var result: String? = null
+        val resolver = resolver(store, now = { 1_000_000L }, discover = {
+            calls++
+            result
+        })
+        assertEquals("https://site2.com", resolver.resolveAfterFailure("https://site2.com"))
+        assertEquals("https://site2.com", resolver.resolveAfterFailure("https://site2.com"))
+        assertEquals(1, calls)
+        assertEquals("https://site2.com", store.strings["cached"])
+        resolver.clearCache()
+        result = "https://site3.com"
+        assertEquals("https://site3.com", resolver.resolveAfterFailure("https://site1.com"))
+        assertEquals(2, calls)
+        // A late failure cannot expire the new address.
+        assertEquals("https://site3.com", resolver.resolveAfterFailure("https://site2.com"))
+        assertEquals(2, calls)
+    }
+
+    @Test
+    fun rediscoveringSameDeadOriginDoesNotCreateARefreshStorm() {
+        val store = FakeStorage(strings = mutableMapOf("cached" to "https://site2.com"), longs = mutableMapOf("fetched" to 999_000L))
+        var calls = 0
+        val resolver = resolver(store, now = { 1_000_000L }, discover = {
+            calls++
+            "https://site2.com"
+        })
+        repeat(20) { assertEquals("https://site2.com", resolver.resolveAfterFailure("https://site2.com")) }
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun failureInvalidatesOlderLookupAndConcurrentCallersShareRecovery() {
+        val store = FakeStorage(strings = ConcurrentHashMap(mapOf("cached" to "https://site2.com")), longs = ConcurrentHashMap())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val calls = AtomicInteger()
+        val resolver = resolver(store, now = { 100_000_000L }, discover = {
+            if (calls.incrementAndGet() == 1) {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+                "https://site2.com"
+            } else {
+                "https://site3.com"
+            }
+        })
+        val executor = Executors.newFixedThreadPool(3)
+        try {
+            val normal = executor.submit<String> { resolver.resolve() }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            val recovery = executor.submit<String> { resolver.resolveAfterFailure("https://site2.com") }
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (store.getLong(keys.recoveryAttemptedAt) == 0L && System.nanoTime() < deadline) Thread.yield()
+            assertTrue(store.getLong(keys.recoveryAttemptedAt) > 0L)
+            val concurrent = executor.submit<String> { resolver.resolveAfterFailure("https://site2.com") }
+            release.countDown()
+            listOf(normal, recovery, concurrent).forEach { assertEquals("https://site3.com", it.get(5, TimeUnit.SECONDS)) }
+            assertEquals(2, calls.get())
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
     private fun resolver(
         store: FakeStorage,
         now: () -> Long,

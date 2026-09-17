@@ -8,6 +8,17 @@ import org.jsoup.Jsoup
 
 internal const val GOODTOON_CHANNEL = "https://t.me/s/goodtoon_url"
 internal fun isGoodToonHost(host: String) = Regex("""^(?:www\.)?goodtoon\d+\.com$""").matches(host)
+internal fun isGoodToonImageHost(host: String) = host == "img.goodtoon9001.top"
+
+// Cover requests use HttpSource's cached headers. Keep the CDN destination but
+// refresh its hotlink headers too, including the reader path for page images.
+internal fun Request.rewriteGoodToonImageHeaders(target: String): Request {
+    if (!isGoodToonImageHost(url.host)) return this
+    val referer = header("Referer")?.let { runCatching { it.toHttpUrl() }.getOrNull() }
+        ?.newBuilder()?.scheme("https")?.host(target.toHttpUrl().host)?.port(443)?.build()?.toString()
+        ?: "$target/"
+    return newBuilder().header("Referer", referer).header("Origin", target).build()
+}
 
 // Called only after the interceptor checks the request's site/manual host. A cached
 // header may still refer to a previous manual origin that is no longer in that set.

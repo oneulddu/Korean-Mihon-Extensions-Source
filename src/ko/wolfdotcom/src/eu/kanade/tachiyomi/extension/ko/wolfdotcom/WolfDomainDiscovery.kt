@@ -12,12 +12,12 @@ import java.util.concurrent.TimeUnit
 internal const val WOLF_GUIDE_URL = "https://a14c.com/"
 
 // The content site's own address-guide navigation links to this public channel.
-internal const val WOLF_CHANNEL_URL = "https://t.me/s/wfwf_com"
+internal const val WOLF_CHANNEL_URL = "https://t.me/s/wftoon"
 
 internal fun parseWolfOfficialChannel(html: String): String? = Jsoup.parse(html, WOLF_CHANNEL_URL)
     .select(".tgme_widget_message[data-post]")
     .mapNotNull { message ->
-        val post = Regex("""^wfwf_com/(\d+)$""").matchEntire(message.attr("data-post"))
+        val post = Regex("""^wftoon/(\d+)$""").matchEntire(message.attr("data-post"))
             ?.groupValues?.get(1)?.toLongOrNull() ?: return@mapNotNull null
         if (message.selectFirst(".tgme_widget_message_forwarded_from") != null) return@mapNotNull null
         val text = message.selectFirst(".tgme_widget_message_text") ?: return@mapNotNull null

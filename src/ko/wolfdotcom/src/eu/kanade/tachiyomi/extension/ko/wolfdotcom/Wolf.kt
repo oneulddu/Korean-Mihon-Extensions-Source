@@ -13,11 +13,14 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.AutomaticDomainInterceptor
 import keiyoushi.utils.BaseUrlCacheKeys
 import keiyoushi.utils.DynamicBaseUrlResolver
 import keiyoushi.utils.SharedPreferencesBaseUrlStorage
+import keiyoushi.utils.findDiscoveredBaseUrl
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.normalizeBaseUrl
+import keiyoushi.utils.normalizeDiscoveredBaseUrl
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.rewriteBaseUrl
 import keiyoushi.utils.shouldInvalidateNumberedDomainCache
@@ -54,7 +57,16 @@ open class Wolf(
     override val supportsLatest = true
 
     override val client = network.client.newBuilder()
-        .addInterceptor(::domainNumberInterceptor)
+        .addInterceptor(
+            AutomaticDomainInterceptor(
+                resolver = { latestBaseUrlResolver },
+                manualBaseUrl = ::getManualBaseUrl,
+                isAutomaticHost = { it.matches(domainHostRegex) },
+                rewrite = ::rewriteDomainRequest,
+                migrationTarget = { parseWolfMigrationPage(it.peekBody(128 * 1024).string(), it.request.url.toString()) },
+                onRedirect = { saveAutomaticBaseUrlSource(SOURCE_NUMBERED_PROBE) },
+            ),
+        )
         .addNetworkInterceptor(::refererInterceptor)
         .build()
 
@@ -70,11 +82,11 @@ open class Wolf(
 
     private val latestBaseUrlResolver by lazy {
         migrateLegacyDomainCache()
-        if (!preference.getBoolean("official_guide_discovery_v1", false)) {
+        if (!preference.getBoolean("official_guide_discovery_v2", false)) {
             preference.edit()
                 .remove(PREF_LATEST_DOMAIN_FETCHED_AT)
                 .remove(PREF_LATEST_DOMAIN_ATTEMPTED_AT)
-                .putBoolean("official_guide_discovery_v1", true)
+                .putBoolean("official_guide_discovery_v2", true)
                 .apply()
         }
         DynamicBaseUrlResolver(
@@ -381,19 +393,16 @@ open class Wolf(
             field = value
         }
 
-    private fun domainNumberInterceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
+    private fun rewriteDomainRequest(request: Request): Request {
         val manualBaseUrl = getManualBaseUrl()?.toHttpUrl()
         val isAutomaticHost = request.url.host.matches(domainHostRegex)
         val isManualHost = manualBaseUrl != null && request.url.host == manualBaseUrl.host
-        if (!isAutomaticHost && !isManualHost) return chain.proceed(request)
+        if (!isAutomaticHost && !isManualHost) return request
 
         val resolvedBaseUrl = manualBaseUrl?.toString() ?: latestBaseUrlResolver.resolve()
-        val rewrittenRequest = request.rewriteBaseUrl(resolvedBaseUrl) { host ->
+        return request.rewriteBaseUrl(getManualBaseUrl() ?: resolvedBaseUrl) { host ->
             host.matches(domainHostRegex) || host == manualBaseUrl?.host
         }
-
-        return chain.proceed(rewrittenRequest)
     }
 
     private val domainDiscovery by lazy { WolfDomainDiscovery(noRedirectClient) }
@@ -404,16 +413,23 @@ open class Wolf(
     }
 
     private fun resolveRedirectBaseUrl(): String? = runCatching {
-        noRedirectClient.newCall(GET("https://${domainHost(domainNumber)}", headers)).execute().use { response ->
-            val resolvedBaseUrl = response.header("Location")
-                ?.let(response.request.url::resolve)
-                ?.takeIf(::isValidDiscoveredDomain)
-                ?.toString()
-                ?.trimEnd('/')
-                ?: response.request.url
-                    .takeIf { response.isSuccessful && isValidDiscoveredDomain(it) }
+        val current = latestBaseUrlResolver.cachedBaseUrl() ?: "https://${domainHost(domainNumber)}"
+        noRedirectClient.newCall(GET(current, headers)).execute().use { response ->
+            val resolvedBaseUrl = if (response.code in 300..399) {
+                response.header("Location")
+                    ?.let(response.request.url::resolve)
+                    ?.takeIf(::isValidDiscoveredDomain)
                     ?.toString()
                     ?.trimEnd('/')
+            } else if (response.isSuccessful) {
+                val body = response.body.string()
+                parseWolfMigrationPage(body, current) ?: current.takeIf {
+                    // A 200 migration/parking/error page is not a healthy catalogue.
+                    Jsoup.parse(body).selectFirst("a.t-card, .w-title") != null
+                }
+            } else {
+                null
+            }
 
             resolvedBaseUrl?.also { saveAutomaticBaseUrlSource(SOURCE_NUMBERED_PROBE) }
         }
@@ -424,6 +440,7 @@ open class Wolf(
         url.port == 443 &&
         url.encodedPath == "/" &&
         url.query == null &&
+        url.fragment == null &&
         url.username.isEmpty() &&
         url.password.isEmpty()
 
@@ -471,19 +488,20 @@ private const val SOURCE_BUILD_DEFAULT = "빌드 기본 주소"
 
 private val wolfDomainHostRegex = Regex("""^wfwf\d+\.com$""")
 private val wolfDomainNumberRegex = Regex("""^wfwf(\d+)\.com$""")
-private val latestWolfDomainRegex =
-    Regex("""(?i)(?<![a-z0-9.-])(?:https?://)?wfwf\d+\.com(?![a-z0-9.-])""")
 
 internal fun parseWolfLatestBaseUrl(html: String, portalUrl: String): String? {
     val document = Jsoup.parse(html, portalUrl)
     val candidates = sequence {
-        yieldAll(document.select("a[href]").asSequence().map { it.absUrl("href") })
+        yieldAll(document.select("a[href]").asSequence().map { it.attr("href") })
         yield(document.outerHtml())
     }
 
     return candidates
-        .flatMap { latestWolfDomainRegex.findAll(it).map(MatchResult::value) }
-        .map { if (it.startsWith("http", ignoreCase = true)) it else "https://$it" }
-        .mapNotNull { normalizeBaseUrl(it) { url -> url.host.matches(wolfDomainHostRegex) } }
+        .mapNotNull { findDiscoveredBaseUrl(it) { host -> host.matches(wolfDomainHostRegex) } }
         .firstOrNull()
 }
+
+internal fun parseWolfMigrationPage(html: String, current: String): String? = Jsoup.parse(html, current)
+    .select("a.main-btn[href]").firstNotNullOfOrNull {
+        normalizeDiscoveredBaseUrl(it.attr("href")) { host -> host.matches(wolfDomainHostRegex) }
+    }
