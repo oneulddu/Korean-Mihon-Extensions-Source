@@ -99,3 +99,31 @@ Toonkor는 확인된 공식 안내 주소가 없어 이번 브랜치에 포함�
 ### 짭툰 접속 검증 대기
 
 첫 안내 API 실패 후 과거 HTML 주소를 즉시 반환하는 동작을 수정해 보조 안내 API까지 확인하도록 준비했다. 전체 주소 검증, 자동 주소 복구와 회귀 테스트도 통과했다. 그러나 이 환경에서는 공식 `.net`·`.live`·`.cc` 안내와 `www.jjaptoon008.com`이 TLS 연결 단계에서 재설정되며, Mihon에서도 같은 접속 실패가 발생했다. 직접 연결 성공 또는 목록·상세·회차·뷰어 성공으로 보고하지 않는다. 런타임 검증 예외 승인이 없는 동안 짭툰의 버전 인상과 커밋·푸시는 보류한다.
+
+
+## main 반영 및 실제 APK 배포 (2026-09-18)
+
+작업 브랜치에만 머지했던 상태를 [PR #29](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/pull/29)로 바로잡았다. 이미 공개 배포된 이전 소스와 이번 굿툰·늑대닷컴 수정을 `main`에 반영했고, main 푸시가 자동 배포를 실행했다.
+
+- 소스 머지 커밋: `8b0945c95c4c2e2c515b9dcd98b0f26800d52918`.
+- [자동 배포 실행 35271782999](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/35271782999): `push`, `main`, `success`.
+- 배포 저장소 `repo` 커밋: `7fb76eeed9481588fcb8bb2345fef06f4a2acbb2`.
+- 공개 인덱스의 굿툰 1.4.2·늑대닷컴 1.4.14를 확인했다. 나머지 8개 확장 항목은 배포 전과 동일하며 10개 확장·15개 소스 ID를 유지했다.
+- 공개 APK 10개를 직접 다운로드해 패키지명·버전·서명을 확인했다. 모든 서명 인증서 SHA-256은 기존 `b25af02d178fad20ebe739e59336f2ae5e307dcd1375418278e752dba03497cb`와 일치한다.
+- 굿툰 APK SHA-256: `dd8b04aaf8623547f44a05f4c7d3614b6d95382b9480f2faa4bdd1480dd32126`.
+- 늑대닷컴 APK SHA-256: `ead70933b49fcd1ae65ebb3946b60b6320401b8187e43896e344d4a04a6fd5bd`.
+
+짭툰의 이번 미검증 수정은 포함하지 않았고 공개 버전은 기존 1.4.16을 유지한다. 보류 수정은 `feature/jjaptoon-runtime-0918` 작업 트리에 보존했다.
+
+### 7월 27일 작업 배포 감사
+
+7월 27일 작업은 당시 main에 반영되고 APK도 공개 배포됐다. [당일 최종 배포 커밋](https://github.com/oneulddu/Korean-Mihon-Extensions/commit/117a7c8f2e5faac5389e9f362a96736ebdbfdef6)의 인덱스를 직접 대조했다.
+
+| 확장 | 당일 공개 버전 | 배포 실행 |
+|---|---|---|
+| 늑대닷컴 | 1.4.10 | [30245669649](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/30245669649) |
+| 툰코르 | 1.4.11 | [30246584323](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/30246584323) |
+| X툰 | 1.4.6 | [30247404215](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/30247404215) |
+| 짭툰 | 1.4.11 | [30248478871](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/30248478871) |
+
+늑대닷컴 최초 자동 실행 `30245209686`은 실패했으나 같은 날 수동 실행 `30245669649`가 성공하고 배포 커밋 `645af90bb0457fd15b7fd5f3e845f3734bd2491c`을 생성했다. 이를 미배포 상태로 판단하지 않는다.

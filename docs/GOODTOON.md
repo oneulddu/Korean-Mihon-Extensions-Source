@@ -71,3 +71,8 @@ Mihon의 `HttpSource.headers`는 처음 생성한 값을 재사용하므로 도�
 - 목록 표지 및 뷰어 이미지 요청에서 CDN 주소 보존·현재 Referer/Origin·이전 수동 주소 처리·무관한 외부 호스트 보존 회귀 검사를 통과했다.
 
 화면 증거는 `/tmp/mihon-fixes-0918/goodtoon-after.png`, `goodtoon-detail-final.png`, `goodtoon-viewer-final.png`, `goodtoon-470-viewer.png`에 보관했다. 전체 Spotless, Kotlin 162개(로컬 짭툰 보류 수정과 리뷰 후 추가한 공통 코드 회귀 2개 포함), Python 12개, JavaScript 2개가 통과했다. Astra 독립 리뷰에서 발견한 주소 복구 재시도·본문 읽기 오류 처리 두 건도 수정하고 해당 검사를 다시 통과했다.
+
+
+### 1.4.2 공개 배포 완료
+
+[PR #29](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/pull/29)로 main에 반영한 뒤 [자동 배포 35271782999](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/35271782999)가 성공했다. 공개 인덱스와 [굿툰 1.4.2 APK](https://raw.githubusercontent.com/oneulddu/Korean-Mihon-Extensions/repo/apk/tachiyomi-ko.goodtoon-v1.4.2-release.apk)의 버전·서명을 직접 확인했다. 커밋과 SHA-256 및 다른 확장 보존 결과는 [주소 복구 배포 기록](ADDRESS_DISCOVERY.md)에 남겼다.
