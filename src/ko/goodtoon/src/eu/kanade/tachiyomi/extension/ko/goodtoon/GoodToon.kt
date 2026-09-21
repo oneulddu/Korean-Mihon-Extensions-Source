@@ -14,12 +14,14 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.AutomaticDomainInterceptor
 import keiyoushi.utils.BaseUrlCacheKeys
 import keiyoushi.utils.DynamicBaseUrlResolver
 import keiyoushi.utils.SharedPreferencesBaseUrlStorage
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.normalizeBaseUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Request
 import okhttp3.Response
 import java.util.concurrent.TimeUnit
 
@@ -72,17 +74,29 @@ class GoodToon :
         )
     }
 
-    override val client = network.cloudflareClient.newBuilder().addInterceptor { chain ->
-        val request = chain.request()
+    override val client = network.cloudflareClient.newBuilder()
+        .addInterceptor(
+            AutomaticDomainInterceptor(
+                resolver = { resolver },
+                manualBaseUrl = ::manualBaseUrl,
+                isAutomaticHost = ::isGoodToonHost,
+                rewrite = ::rewriteRequest,
+                onRedirect = { preferences.edit().putString("automatic_source", "콘텐츠 주소 리다이렉트").apply() },
+            ),
+        )
+        .addInterceptor(GoodToonGuideRedirectInterceptor(::manualBaseUrl))
+        .build()
+
+    private fun rewriteRequest(request: Request): Request {
         val manual = manualBaseUrl()
-        val ownHost: (String) -> Boolean = { isGoodToonHost(it) || it == manual?.toHttpUrl()?.host }
+        val ownHost = isGoodToonHost(request.url.host) || request.url.host == manual?.toHttpUrl()?.host
         val isImage = isGoodToonImageHost(request.url.host)
-        if (!ownHost(request.url.host) && !isImage) return@addInterceptor chain.proceed(request)
+        if (!ownHost && !isImage) return request
         val automatic = manual ?: resolver.resolve()
         // A setting changed while discovery was in flight still takes priority.
         val target = manualBaseUrl() ?: automatic
-        chain.proceed(if (isImage) request.rewriteGoodToonImageHeaders(target) else request.rewriteGoodToonOrigin(target))
-    }.build()
+        return if (isImage) request.rewriteGoodToonImageHeaders(target) else request.rewriteGoodToonOrigin(target)
+    }
 
     override fun headersBuilder() = super.headersBuilder().set("Referer", "$baseUrl/")
 
@@ -193,6 +207,6 @@ class GoodToon :
         val value get() = options[state].second
     }
     companion object {
-        private const val DEFAULT_URL = "https://www.goodtoon004.com"
+        private const val DEFAULT_URL = "https://goodtoon005.com"
     }
 }

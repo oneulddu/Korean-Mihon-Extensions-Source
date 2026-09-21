@@ -23,7 +23,20 @@ internal data class GoodToonChapter(val url: String, val name: String, val date:
 internal data class GoodToonCatalogue(val mangas: List<GoodToonManga>, val hasNext: Boolean)
 
 internal object GoodToonParser {
-    val mangaPath = Regex("/manga/gt-[0-9]+/")
+    private fun isPathSegment(value: String) = value.isNotBlank() && value != "." && value != ".." &&
+        value.none { it == '/' || it == '\\' || it.isISOControl() }
+
+    // New works use title slugs, while existing gt-ID URLs remain unchanged.
+    private fun isMangaPath(segments: List<String>) = segments.size == 3 &&
+        segments[0] == "manga" && isPathSegment(segments[1]) && segments[2].isEmpty()
+
+    private fun HttpUrl.parts() = pathSegments.let { if (it.last().isEmpty()) it.dropLast(1) else it }
+
+    // The site mixes upper/lower percent escapes. Stable stored paths prevent a
+    // refresh from creating duplicate manga/chapters and losing read-state links.
+    private fun HttpUrl.storedPath() = newBuilder().encodedPath("/").apply {
+        pathSegments.forEach { addPathSegment(it) }
+    }.build().encodedPath
 
     private fun contentUrl(raw: String, current: HttpUrl): HttpUrl? = current.resolve(raw)?.takeIf {
         it.scheme == "https" && it.port == 443 && it.username.isEmpty() && it.password.isEmpty() &&
@@ -40,11 +53,11 @@ internal object GoodToonParser {
         val grid = document.selectFirst(".card-grid") ?: throw IOException("굿툰 작품 목록을 읽을 수 없습니다.")
         val cards = grid.select("a.card[href]")
         val mangas = cards.map { card ->
-            val url = contentUrl(card.attr("href"), current)?.takeIf { mangaPath.matches(it.encodedPath) }
+            val url = contentUrl(card.attr("href"), current)?.takeIf { isMangaPath(it.pathSegments) }
                 ?: throw IOException("굿툰 작품 주소가 올바르지 않습니다.")
             val title = card.selectFirst(".subject")?.text().orEmpty()
             if (title.isBlank()) throw IOException("굿툰 작품 제목이 없습니다.")
-            GoodToonManga(url.encodedPath, title, card.selectFirst(".thumb img:not(.platform-icon)")?.let { imageUrl(it, "src", current) })
+            GoodToonManga(url.storedPath(), title, card.selectFirst(".thumb img:not(.platform-icon)")?.let { imageUrl(it, "src", current) })
         }.distinctBy { it.url }
         val nextPage = (current.queryParameter("pg")?.toIntOrNull() ?: 1) + 1
         val next = mangas.isNotEmpty() && document.select(".pagination a.page-numbers[href]").any { link ->
@@ -65,10 +78,10 @@ internal object GoodToonParser {
         val current = document.location().toHttpUrl()
         val info = document.selectFirst(".manga-summary-info") ?: throw IOException("굿툰 작품 상세를 읽을 수 없습니다.")
         val title = info.selectFirst(".summary-title")?.text().orEmpty()
-        if (title.isBlank() || !mangaPath.matches(current.encodedPath)) throw IOException("굿툰 작품 상세가 올바르지 않습니다.")
+        if (title.isBlank() || !isMangaPath(current.pathSegments)) throw IOException("굿툰 작품 상세가 올바르지 않습니다.")
         val status = info.select(".summary-meta-row .meta-value").map { it.text() }
         return GoodToonManga(
-            current.encodedPath,
+            current.storedPath(),
             title,
             document.selectFirst(".manga-summary-cover img")?.let { imageUrl(it, "src", current) },
             info.selectFirst(".author-text")?.text(),
@@ -84,8 +97,11 @@ internal object GoodToonParser {
 
     fun chapters(document: Document): List<GoodToonChapter> {
         val current = document.location().toHttpUrl()
-        val parent = current.encodedPath.removeSuffix("ajax/chapters")
-        if (!mangaPath.matches(parent)) throw IOException("굿툰 회차 요청 주소가 올바르지 않습니다.")
+        val requestParts = current.parts()
+        val parent = requestParts.dropLast(2)
+        if (requestParts.takeLast(2) != listOf("ajax", "chapters") || !isMangaPath(parent + "")) {
+            throw IOException("굿툰 회차 요청 주소가 올바르지 않습니다.")
+        }
         val rows = document.select("li.wp-manga-chapter")
         if (rows.isEmpty()) throw IOException("굿툰 회차 목록을 읽을 수 없습니다. 다시 시도해 주세요.")
         val dateFormat = SimpleDateFormat("yyyy.MM.dd", Locale.ROOT).apply {
@@ -95,8 +111,9 @@ internal object GoodToonParser {
         return rows.map { row ->
             val anchor = row.selectFirst("a[href]") ?: throw IOException("굿툰 회차 링크가 없습니다.")
             val url = contentUrl(anchor.attr("href"), current)?.takeIf {
-                it.encodedPath.startsWith(parent) && it.encodedPath != parent &&
-                    it.encodedPath != current.encodedPath
+                val parts = it.parts()
+                parts.size > parent.size && parts.take(parent.size) == parent &&
+                    parts[parent.size] != "ajax" && parts.all(::isPathSegment)
             } ?: throw IOException("다른 작품이거나 올바르지 않은 굿툰 회차 주소입니다.")
             val title = anchor.clone().apply { select(".up-badge-inline").remove() }.text()
             if (title.isBlank()) throw IOException("굿툰 회차 제목이 없습니다.")
@@ -106,7 +123,7 @@ internal object GoodToonParser {
             // Use the explicit episode suffix rather than Mihon's first-number guess.
             val number = Regex("([0-9]+(?:\\.[0-9]+)?)\\s*화(?:\\s|$)").findAll(title).lastOrNull()
                 ?.groupValues?.get(1)?.toFloatOrNull() ?: -1f
-            GoodToonChapter(url.encodedPath, title, runCatching { dateFormat.parse(fullDate)?.time }.getOrNull() ?: 0L, number)
+            GoodToonChapter(url.storedPath(), title, runCatching { dateFormat.parse(fullDate)?.time }.getOrNull() ?: 0L, number)
         }.also { chapters ->
             if (chapters.map { it.url }.distinct().size != chapters.size) throw IOException("굿툰 회차 목록에 중복 주소가 있습니다.")
         }
