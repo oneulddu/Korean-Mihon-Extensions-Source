@@ -95,3 +95,16 @@ Mihon의 `HttpSource.headers`는 처음 생성한 값을 재사용하므로 도�
 검증 중 시스템 DNS와 일부 공개 DNS가 005의 변경 전 서버 IP를 반환해 Android 인증서 오류가 발생했다. Mihon의 Google DoH로 현재 서버를 조회해 위 앱 검증을 진행했다. 확장의 DNS나 인증서 검증은 변경하지 않았다. DNS 전파 상태에 따른 접속 차이는 별개이며, iOS Tachimanga의 흰 썸네일 증상은 직접 검증하지 못했다.
 
 화면 증거는 `/tmp/goodtoon-0921/automatic-catalogue.png`, `title-detail.png`, `title-viewer.png`, `long-detail.png`, `long-viewer.png`에 보관했다. 대표 작품의 확인 결과이며 모든 작품·페이지나 다른 앱의 동작을 보증하지 않는다.
+
+
+### 1.4.3 main 반영 및 공개 배포 완료
+
+[PR #30](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/pull/30)을 main에 병합한 소스 커밋은 `414e0dd4648dcc4e9dd839f205e230067329290b`다. main push의 [자동 배포 35599712632](https://github.com/oneulddu/Korean-Mihon-Extensions-Source/actions/runs/35599712632)가 성공했고, 배포 저장소 `repo`의 커밋 `4fdcbf9d2b5cf1f4b6d289afcc9adb3ec99c7e99`가 해당 소스 SHA를 기록한다.
+
+공개 `index.json`과 `index.min.json`, 실제 다운로드 APK를 검사했다. 굿툰은 versionCode 3·versionName 1.4.3이며 패키지명과 기존 서명이 유지됐다. 전체 10개 확장·15개 소스 ID와 굿툰 외 9개 확장의 인덱스 항목도 그대로다. 메타데이터 파일 변경 때문에 워크플로는 기존 규칙대로 전체 모듈을 다시 빌드했으며, 다른 확장의 버전이나 동작 변경은 포함하지 않았다.
+
+- [굿툰 1.4.3 APK](https://raw.githubusercontent.com/oneulddu/Korean-Mihon-Extensions/repo/apk/tachiyomi-ko.goodtoon-v1.4.3-release.apk)
+- APK SHA-256: `e7417bf02249e75c8e114b82341eaed27aecb119e6a7255292ff14c8dad0b5c3`
+- 서명 인증서 SHA-256: `b25af02d178fad20ebe739e59336f2ae5e307dcd1375418278e752dba03497cb`
+
+검증용 브라우저 탭과 에뮬레이터를 종료했고 임시 Google DoH 설정은 기존 기본값으로 복원했다. 다른 작업 트리의 보류된 짭툰 수정은 이번 배포에 포함하지 않고 보존했다.
