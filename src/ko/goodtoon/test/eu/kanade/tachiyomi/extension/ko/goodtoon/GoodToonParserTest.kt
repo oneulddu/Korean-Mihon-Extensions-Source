@@ -2,12 +2,14 @@ package eu.kanade.tachiyomi.extension.ko.goodtoon
 
 import keiyoushi.utils.normalizeBaseUrl
 import keiyoushi.utils.rewriteBaseUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import org.jsoup.Jsoup
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
@@ -16,6 +18,69 @@ class GoodToonParserTest {
     private val base = "https://www.goodtoon003.com"
     private fun fixture(name: String) = javaClass.getResource("/$name.html")!!.readText()
     private fun document(name: String, path: String) = Jsoup.parse(fixture(name), base + path)
+    private val titlePath = "$base/manga/물고-뜯고-속이고/".toHttpUrl().encodedPath
+
+    @Test fun newTitleSlugDoesNotBreakTheMixedCatalogueOrCoverCacheVersion() {
+        val result = GoodToonParser.catalogue(document("list-title-slug", "/?pg=1"))
+        assertEquals(listOf("/manga/gt-21953/", titlePath), result.mangas.map { it.url })
+        assertEquals("물고 뜯고 속이고", result.mangas.last().title)
+        assertEquals("https://img.goodtoon9001.top/gt-61695/cover.jpg?v=1789915050", result.mangas.last().thumbnail)
+        assertTrue(result.hasNext)
+        val detail = GoodToonParser.details(document("detail-title-slug", titlePath.lowercase()))
+        assertEquals(titlePath, detail.url)
+        assertEquals("강해주", detail.author)
+        assertEquals(result.mangas.last().thumbnail, detail.thumbnail)
+    }
+
+    @Test fun encodedAliasesHaveStableMangaAndChapterUrlsAcrossRefreshes() {
+        val doc = document("list-title-slug", "/")
+        val card = doc.select("a.card").last()!!
+        card.parent()!!.appendChild(card.clone().attr("href", titlePath))
+        assertEquals(2, GoodToonParser.catalogue(doc).mangas.size)
+        val chapters = GoodToonParser.chapters(document("chapters-title-slug", titlePath + "ajax/chapters"))
+        assertEquals(listOf(titlePath + "2/", titlePath + "1/"), chapters.map { it.url })
+        assertEquals("02. 한준혁이 약속을 지켰어", chapters.first().name)
+        val refreshed = document("chapters-title-slug", titlePath.lowercase() + "ajax/chapters/?t=1")
+        refreshed.select("a[href]").forEach { it.attr("href", it.attr("href").uppercase().replace("/MANGA/", "/manga/")) }
+        assertEquals(chapters, GoodToonParser.chapters(refreshed))
+    }
+
+    @Test fun keepsVolumePathsAndAsciiSlugCase() {
+        val doc = document("chapters-title-slug", titlePath + "ajax/chapters")
+        doc.selectFirst("a")!!.attr("href", titlePath + "1%ea%b6%8c/2/")
+        assertEquals(titlePath + "1%EA%B6%8C/2/", GoodToonParser.chapters(doc).first().url)
+        val detail = document("detail-title-slug", "/manga/Title-Case/")
+        assertEquals("/manga/Title-Case/", GoodToonParser.details(detail).url)
+    }
+
+    @Test fun rejectsMangaRootsNestedPathsAndEncodedSeparators() {
+        listOf("/manga/", "/manga/title/nested/", "/manga/one%2ftwo/", "/manga/one%5ctwo/", "/manga/%00/", "/other/title/", "/manga/%2e%2e/").forEach { path ->
+            val doc = document("list-title-slug", "/")
+            doc.selectFirst("a.card")!!.attr("href", path)
+            assertThrows(path, IOException::class.java) { GoodToonParser.catalogue(doc) }
+        }
+    }
+
+    @Test fun rejectsForeignChaptersMangaSelfLinksAndAjaxDescendants() {
+        listOf(titlePath, titlePath.removeSuffix("/"), titlePath + "ajax/chapters/", titlePath + "ajax/other/", titlePath + "bad%2fpath/", "/manga/other-title/2/", "https://evil.example${titlePath}2/").forEach { href ->
+            val doc = document("chapters-title-slug", titlePath + "ajax/chapters")
+            doc.selectFirst("a")!!.attr("href", href)
+            assertThrows(href, IOException::class.java) { GoodToonParser.chapters(doc) }
+        }
+    }
+
+    @Test fun rejectsDuplicateChapterWhenOnlyPercentHexCaseDiffers() {
+        val doc = document("chapters-title-slug", titlePath + "ajax/chapters")
+        doc.select("a").last()!!.attr("href", titlePath + "2/")
+        assertThrows(IOException::class.java) { GoodToonParser.chapters(doc) }
+    }
+
+    @Test fun newTitleReaderRetainsAll76TimestampedImageUrls() {
+        val images = GoodToonParser.images(document("reader-title-slug", titlePath + "2/"))
+        assertEquals(76, images.size)
+        assertEquals("https://img.goodtoon9001.top/gt-61695/ch-1789915083171/001.jpg", images.first())
+        assertEquals("https://img.goodtoon9001.top/gt-61695/ch-1789915083171/076.jpg", images.last())
+    }
 
     @Test fun catalogueUsesActualNextLinksAndExcludesPlatformIcon() {
         val result = GoodToonParser.catalogue(document("list", "/?pg=1"))
