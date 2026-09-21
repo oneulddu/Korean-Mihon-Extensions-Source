@@ -20,7 +20,7 @@ internal class GoodToonGuideRedirectInterceptor(private val manualBaseUrl: () ->
         }
         if (target?.isOfficialGuide() == true) {
             response.close()
-            throw IOException("굿툰 접속 주소가 변경되었습니다. 최신 주소를 확인합니다.")
+            throw IOException("굿툰 접속 주소가 변경되었습니다. 잠시 후 다시 시도해 주세요.")
         }
         return response
     }
